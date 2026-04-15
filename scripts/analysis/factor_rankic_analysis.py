@@ -1,0 +1,648 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+因子Rank IC分析工具
+支持过滤ST股票、涨跌停股票
+"""
+
+import pandas as pd
+import numpy as np
+import pickle
+import os
+from scipy.stats import spearmanr
+from scipy.stats import t as student_t
+from datetime import datetime
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
+import matplotlib.pyplot as plt
+
+def _parallel_ic_calc(args):
+    d, g, factor_name = args
+    n = len(g)
+    if n < 3:
+        return (d, n, np.nan, np.nan)
+    ic_val = g[factor_name].corr(g['return'])
+    g2 = g.copy()
+    g2['f_rank'] = g2[factor_name].rank(method='average')
+    g2['r_rank'] = g2['return'].rank(method='average')
+    rank_ic_val = g2['f_rank'].corr(g2['r_rank'])
+    return (d, n, ic_val, rank_ic_val)
+
+def _parallel_decile_calc(args):
+    d, g, factor_name, n_bins = args
+    g = g.dropna(subset=[factor_name, 'return'])
+    if g[factor_name].notna().sum() < n_bins:
+        return (d, None)
+    try:
+        bins = pd.qcut(g[factor_name], q=n_bins, labels=False, duplicates='drop')
+    except Exception:
+        return (d, None)
+    g = g.assign(bin=bins.astype(int))
+    means = g.groupby('bin')['return'].mean()
+    return (d, means.to_dict())
+
+class FactorRankICAnalyzer:
+    """因子Rank IC分析器"""
+    
+    def __init__(self, data_pkl='data.pkl'):
+        """
+        初始化分析器
+        
+        参数:
+            data_pkl: 行情数据文件路径
+        """
+        self.data_pkl = data_pkl
+        self.market_data = None
+        self.factor_data = None
+        self.merged_data = None
+        self.ic_results = None
+        self.backtest_daily_returns = None
+        self.backtest_cum_returns = None
+        
+    def load_market_data(self):
+        """加载行情数据"""
+        print(f"Loading market data from {self.data_pkl}...")
+        
+        with open(self.data_pkl, 'rb') as f:
+            self.market_data = pickle.load(f)
+        
+        print(f"Market data loaded: {self.market_data.shape}")
+        print(f"Date range: {self.market_data['date'].min()} to {self.market_data['date'].max()}")
+        
+        return self
+    
+    def load_factor(self, factor_file):
+        """
+        加载因子数据
+        
+        参数:
+            factor_file: 因子文件路径
+        """
+        print(f"\nLoading factor from {factor_file}...")
+        
+        self.factor_data = pd.read_pickle(factor_file)
+        self.factor_name = self.factor_data.columns[0]
+        
+        print(f"Factor loaded: {self.factor_data.shape}")
+        print(f"Factor name: {self.factor_name}")
+        print(f"Non-null ratio: {self.factor_data[self.factor_name].notna().mean()*100:.2f}%")
+        
+        return self
+    
+    def merge_data(self):
+        """合并行情数据和因子数据"""
+        print("\nMerging market and factor data...")
+        
+        # 确保因子数据有正确的索引
+        if not isinstance(self.factor_data.index, pd.MultiIndex):
+            print("Error: Factor data must have MultiIndex (order_book_id, date)")
+            return self
+        
+        # 重置因子数据索引
+        factor_df = self.factor_data.reset_index()
+        factor_df.columns = ['order_book_id', 'date', self.factor_name]
+        
+        # 合并数据
+        self.merged_data = self.market_data.merge(
+            factor_df,
+            on=['order_book_id', 'date'],
+            how='inner'
+        )
+        
+        print(f"Merged data shape: {self.merged_data.shape}")
+        
+        return self
+    
+    def calculate_rank_ic(self, 
+                         exclude_st=True, 
+                         exclude_limit_up=True, 
+                         exclude_limit_down=True,
+                         exclude_suspended=True,
+                         use_next_day_return=False,
+                         workers=None):
+        """
+        计算Rank IC
+        
+        参数:
+            exclude_st: 是否排除ST股票
+            exclude_limit_up: 是否排除涨停股票
+            exclude_limit_down: 是否排除跌停股票
+            exclude_suspended: 是否排除停牌股票
+            use_next_day_return: 是否使用下一日收益率（前瞻性）
+        
+        返回:
+            IC分析结果DataFrame
+        """
+        print("\n" + "="*80)
+        print("Calculating Rank IC")
+        print("="*80)
+        print(f"Filter Config:")
+        print(f"  Exclude ST: {exclude_st}")
+        print(f"  Exclude Limit Up: {exclude_limit_up}")
+        print(f"  Exclude Limit Down: {exclude_limit_down}")
+        print(f"  Exclude Suspended: {exclude_suspended}")
+        print(f"  Use Next Day Return: {use_next_day_return}")
+        
+        # 复制数据
+        data = self.merged_data.copy()
+        
+        # 计算收益率
+        if use_next_day_return:
+            # 使用下一日收益率（前瞻性，实际交易中可实现）
+            data = data.sort_values(['order_book_id', 'date'])
+            data['return'] = data.groupby('order_book_id')['close'].pct_change(1, fill_method=None).shift(-1)
+        else:
+            # 使用同期收益率（用于分析因子解释能力）
+            data = data.sort_values(['order_book_id', 'date'])
+            data['return'] = data.groupby('order_book_id')['close'].pct_change(1, fill_method=None)
+        
+        # 应用过滤条件
+        if exclude_st:
+            data = data[~data['ST'].astype(bool)]
+        
+        if exclude_limit_up:
+            data = data[~data['limit_up_flag'].astype(bool)]
+        
+        if exclude_limit_down:
+            data = data[~data['limit_down_flag'].astype(bool)]
+        
+        if exclude_suspended:
+            data = data[~data['suspended'].astype(bool)]
+        
+        # 去除无效数据
+        data = data.dropna(subset=[self.factor_name, 'return'])
+        
+        print(f"\nValid records after filtering: {len(data):,}")
+        
+        # 按日期分组并行计算
+        num_days = data['date'].nunique()
+        print(f"\nProcessing {num_days} trading days...")
+
+        # 预分组，避免在子进程里重复过滤
+        grouped = list((d, g[[self.factor_name, 'return']].copy()) for d, g in data.groupby('date', sort=True))
+        tasks = [(d, g, self.factor_name) for d, g in grouped]
+
+        if workers is None or workers <= 1:
+            rows = [_parallel_ic_calc(it) for it in tasks]
+        else:
+            max_workers = min(int(workers), max(1, multiprocessing.cpu_count()))
+            with ProcessPoolExecutor(max_workers=max_workers) as ex:
+                rows = list(ex.map(_parallel_ic_calc, tasks, chunksize=1))
+
+        result = pd.DataFrame(rows, columns=['date', 'n_stocks', 'ic', 'rank_ic'])
+
+        # 仅保留样本数>=50的交易日
+        result = result[result['n_stocks'] >= 50].copy()
+
+        # 近似p值（基于t分布近似）：t = r * sqrt((n-2)/(1-r^2))
+        # 这里对rank_ic计算p值
+        valid = (result['rank_ic'].notna()) & (result['rank_ic'] > -0.999999) & (result['rank_ic'] < 0.999999) & (result['n_stocks'] > 2)
+        t_stat = np.full(len(result), np.nan, dtype=float)
+        df = result.loc[valid, 'n_stocks'].values - 2
+        r = result.loc[valid, 'rank_ic'].values
+        t_stat_valid = np.abs(r) * np.sqrt((df) / (1 - r * r))
+        t_stat[valid.values] = t_stat_valid
+        p_val = np.full(len(result), np.nan, dtype=float)
+        p_val[valid.values] = 2 * student_t.sf(t_stat_valid, df)
+        result['p_value'] = p_val
+
+        # 对Pearson IC计算p值，新增列 ic_p_value（不改变原有列名以保持兼容）
+        valid_ic = (result['ic'].notna()) & (result['ic'] > -0.999999) & (result['ic'] < 0.999999) & (result['n_stocks'] > 2)
+        df_ic = result.loc[valid_ic, 'n_stocks'].values - 2
+        r_ic = result.loc[valid_ic, 'ic'].values
+        t_stat_ic = np.abs(r_ic) * np.sqrt((df_ic) / (1 - r_ic * r_ic))
+        p_val_ic = np.full(len(result), np.nan, dtype=float)
+        p_val_ic[valid_ic.values] = 2 * student_t.sf(t_stat_ic, df_ic)
+        result['ic_p_value'] = p_val_ic
+
+        # 填充ic/rank_ic中的NaN为0以与原逻辑一致
+        result['ic'] = result['ic'].fillna(0)
+        result['rank_ic'] = result['rank_ic'].fillna(0)
+
+        # 保存到对象
+        result['date'] = pd.to_datetime(result['date'])
+        self.ic_results = result[['date', 'ic', 'rank_ic', 'p_value', 'ic_p_value', 'n_stocks']].sort_values('date')
+        
+        print(f"\nCalculated IC for {len(self.ic_results)} valid days")
+        
+        return self
+    
+    def print_statistics(self):
+        """打印IC统计信息"""
+        if self.ic_results is None or len(self.ic_results) == 0:
+            print("No IC results to display")
+            return
+        
+        print("\n" + "="*80)
+        print("Factor Rank IC Statistics")
+        print("="*80)
+        print(f"Factor Name: {self.factor_name}")
+        print(f"Total Valid Days: {len(self.ic_results)}")
+        
+        # IC统计
+        ic_series = self.ic_results['ic']
+        print(f"\nIC Statistics:")
+        print(f"  Mean IC:       {ic_series.mean():.6f}")
+        print(f"  Std IC:        {ic_series.std():.6f}")
+        print(f"  Min IC:        {ic_series.min():.6f}")
+        print(f"  Max IC:        {ic_series.max():.6f}")
+        
+        if ic_series.std() > 0:
+            print(f"  IC IR:         {ic_series.mean() / ic_series.std():.6f}")
+        
+        # IC胜率
+        print(f"  IC Win Rate:   {(ic_series > 0).mean()*100:.2f}%")
+        print(f"  IC > 0.05:     {(ic_series > 0.05).mean()*100:.2f}%")
+        print(f"  IC < -0.05:    {(ic_series < -0.05).mean()*100:.2f}%")
+        
+        # Rank IC统计
+        rank_ic_series = self.ic_results['rank_ic']
+        print(f"\nRank IC Statistics:")
+        print(f"  Mean Rank IC:  {rank_ic_series.mean():.6f}")
+        print(f"  Std Rank IC:   {rank_ic_series.std():.6f}")
+        print(f"  Min Rank IC:   {rank_ic_series.min():.6f}")
+        print(f"  Max Rank IC:   {rank_ic_series.max():.6f}")
+        
+        if rank_ic_series.std() > 0:
+            print(f"  Rank IC IR:    {rank_ic_series.mean() / rank_ic_series.std():.6f}")
+        
+        # Rank IC胜率
+        print(f"  Rank IC Win Rate:  {(rank_ic_series > 0).mean()*100:.2f}%")
+        print(f"  Rank IC > 0.05:    {(rank_ic_series > 0.05).mean()*100:.2f}%")
+        print(f"  Rank IC < -0.05:   {(rank_ic_series < -0.05).mean()*100:.2f}%")
+        
+        # 平均股票数
+        print(f"\nAverage stocks per day: {self.ic_results['n_stocks'].mean():.0f}")
+        
+        print("="*80)
+        
+        return self
+    
+    def save_results(self, output_file=None):
+        """
+        保存IC分析结果
+        
+        参数:
+            output_file: 输出文件路径
+        """
+        if self.ic_results is None or len(self.ic_results) == 0:
+            print("No results to save")
+            return self
+
+        if output_file is None:
+            # 生成默认文件名
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            output_file = f'rankic_results_{self.factor_name}_{timestamp}.csv'
+        
+        self.ic_results.to_csv(output_file, index=False, encoding='utf-8-sig')
+        print(f"\nResults saved to: {output_file}")
+        
+        return self
+
+    def backtest_deciles(self,
+                         n_bins=10,
+                         exclude_st=True,
+                         exclude_limit_up=True,
+                         exclude_limit_down=True,
+                         exclude_suspended=True,
+                         use_next_day_return=True,
+                         workers=None):
+        """
+        因子分位回测（默认10分位），计算等权分组日收益与多空收益（Q10 - Q1）。
+
+        参数:
+            n_bins: 分组数量（默认10）
+            exclude_st/limit_up/limit_down/suspended: 过滤选项
+            use_next_day_return: 是否使用下一日收益进行回测（交易实现）
+
+        结果:
+            self.backtest_daily_returns: DataFrame[date, Q1..Qn, LS]
+            self.backtest_cum_returns: DataFrame[date, Q1..Qn, LS]
+        """
+        if self.merged_data is None:
+            raise ValueError("Please call merge_data() before backtesting.")
+
+        data = self.merged_data.copy()
+
+        # 收益率序列（回测通常使用下一日收益）
+        data = data.sort_values(['order_book_id', 'date'])
+        if use_next_day_return:
+            data['return'] = data.groupby('order_book_id')['close'].pct_change(1, fill_method=None).shift(-1)
+        else:
+            data['return'] = data.groupby('order_book_id')['close'].pct_change(1, fill_method=None)
+
+        # 过滤
+        if exclude_st:
+            data = data[~data['ST'].astype(bool)]
+        if exclude_limit_up:
+            data = data[~data['limit_up_flag'].astype(bool)]
+        if exclude_limit_down:
+            data = data[~data['limit_down_flag'].astype(bool)]
+        if exclude_suspended:
+            data = data[~data['suspended'].astype(bool)]
+
+        # 有效样本
+        data = data.dropna(subset=[self.factor_name, 'return'])
+        if data.empty:
+            raise ValueError("No valid data for backtest after filtering.")
+
+        # 按日期内分位
+        grouped = list((d, g[['order_book_id', self.factor_name, 'return']].copy()) for d, g in data.groupby('date', sort=True))
+        tasks = [(d, g, self.factor_name, n_bins) for d, g in grouped]
+
+        if workers is None or workers <= 1:
+            rows = [_parallel_decile_calc(it) for it in tasks]
+        else:
+            max_workers = min(int(workers), max(1, multiprocessing.cpu_count()))
+            with ProcessPoolExecutor(max_workers=max_workers) as ex:
+                rows = list(ex.map(_parallel_decile_calc, tasks, chunksize=1))
+
+        # 组装为DataFrame
+        records = []
+        for d, means in rows:
+            if means is None or len(means) == 0:
+                continue
+            rec = {'date': d}
+            for k, v in means.items():
+                rec[int(k)] = v
+            records.append(rec)
+        if not records:
+            raise ValueError("All dates failed to form quantile bins; check factor distribution.")
+
+        ret_tbl = pd.DataFrame(records).set_index('date').sort_index()
+
+        # 统一列名 Q1..Qn（Q1为最低分位，Qn为最高分位）
+        col_map = {}
+        for i, c in enumerate(ret_tbl.columns):
+            col_map[c] = f"Q{i+1}"
+        ret_tbl = ret_tbl.rename(columns=col_map)
+
+        # 多空：最高分位 - 最低分位
+        q_low = f"Q1"
+        q_high = f"Q{min(n_bins, len(ret_tbl.columns))}"
+        if q_low in ret_tbl.columns and q_high in ret_tbl.columns:
+            ret_tbl['LS'] = ret_tbl[q_high] - ret_tbl[q_low]
+        else:
+            ret_tbl['LS'] = np.nan
+
+        # 累计曲线（简单复利累计）
+        cum_tbl = (1.0 + ret_tbl.fillna(0)).cumprod() - 1.0
+
+        # 保存到对象
+        ret_tbl = ret_tbl.reset_index()
+        cum_tbl = cum_tbl.reset_index()
+        ret_tbl['date'] = pd.to_datetime(ret_tbl['date'])
+        cum_tbl['date'] = pd.to_datetime(cum_tbl['date'])
+        self.backtest_daily_returns = ret_tbl
+        self.backtest_cum_returns = cum_tbl
+
+        print("\nDecile backtest completed:")
+        print(f"  Trading days: {ret_tbl['date'].nunique()}")
+        print(f"  Columns: {', '.join([c for c in ret_tbl.columns if c != 'date'])}")
+
+        return self
+
+    def save_backtest(self, output_dir=None, prefix=None):
+        """
+        保存分位回测的日收益与累计曲线
+
+        参数:
+            output_dir: 输出目录，默认在当前目录下 backtest_results
+            prefix: 文件名前缀，默认使用因子名
+        """
+        if self.backtest_daily_returns is None or self.backtest_cum_returns is None:
+            print("No backtest results to save")
+            return self
+
+        if output_dir is None:
+            output_dir = 'backtest_results'
+        os.makedirs(output_dir, exist_ok=True)
+
+        if prefix is None:
+            prefix = self.factor_name
+
+        daily_path = os.path.join(output_dir, f"{prefix}_decile_daily_returns.csv")
+        cum_path = os.path.join(output_dir, f"{prefix}_decile_cum_returns.csv")
+
+        self.backtest_daily_returns.to_csv(daily_path, index=False, encoding='utf-8-sig')
+        self.backtest_cum_returns.to_csv(cum_path, index=False, encoding='utf-8-sig')
+
+        print(f"Saved daily returns to: {daily_path}")
+        print(f"Saved cumulative returns to: {cum_path}")
+
+        return self
+
+    def plot_backtest_cumulative(self, from_file=None, output_dir=None, prefix=None):
+        """
+        绘制累计收益曲线图（Q1..Qn 与 LS），英文标签。
+
+        参数:
+            from_file: 可选，直接从CSV读取累计收益（如 *_decile_cum_returns.csv）
+            output_dir: 输出目录（默认 backtest_plots）
+            prefix: 文件名前缀（默认因子名）
+        """
+        if from_file is not None:
+            cum_df = pd.read_csv(from_file)
+        else:
+            if self.backtest_cum_returns is None:
+                print("No cumulative backtest data. Run backtest_deciles() or provide from_file.")
+                return self
+            cum_df = self.backtest_cum_returns.copy()
+
+        if 'date' in cum_df.columns:
+            cum_df['date'] = pd.to_datetime(cum_df['date'])
+            cum_df = cum_df.sort_values('date')
+
+        if output_dir is None:
+            output_dir = 'backtest_plots'
+        os.makedirs(output_dir, exist_ok=True)
+
+        if prefix is None:
+            prefix = getattr(self, 'factor_name', 'factor')
+
+        # 识别分组列与LS
+        cols = [c for c in cum_df.columns if c != 'date']
+        ls_col = 'LS' if 'LS' in cols else None
+        quant_cols = [c for c in cols if c != 'LS']
+        quant_cols_sorted = sorted(quant_cols, key=lambda x: int(x[1:]) if x.startswith('Q') and x[1:].isdigit() else 0)
+
+        # 绘制全部分组 + LS
+        plt.figure(figsize=(12, 6))
+        for c in quant_cols_sorted:
+            plt.plot(cum_df['date'], cum_df[c], color='#999999', linewidth=1.0, alpha=0.8, label=c if c in ['Q1','Q10'] else None)
+        if 'Q1' in quant_cols_sorted:
+            plt.plot(cum_df['date'], cum_df['Q1'], color='#d62728', linewidth=1.8, label='Q1')
+        if f"Q{len(quant_cols_sorted)}" in quant_cols_sorted:
+            qh = f"Q{len(quant_cols_sorted)}"
+            plt.plot(cum_df['date'], cum_df[qh], color='#1f77b4', linewidth=1.8, label=qh)
+        if ls_col is not None and ls_col in cum_df.columns:
+            plt.plot(cum_df['date'], cum_df[ls_col], color='#2ca02c', linewidth=2.0, label='LS')
+        plt.title('Cumulative Return (Decile Portfolios)', fontsize=13)
+        plt.xlabel('Date')
+        plt.ylabel('Cumulative Return')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        out_all = os.path.join(output_dir, f"{prefix}_decile_cum_all.png")
+        plt.tight_layout()
+        plt.savefig(out_all, dpi=150)
+        plt.close()
+
+        # 单独绘制LS（若存在）
+        if ls_col is not None and ls_col in cum_df.columns:
+            plt.figure(figsize=(12, 6))
+            plt.plot(cum_df['date'], cum_df[ls_col], color='#2ca02c', linewidth=2.0, label='LS')
+            plt.title('Cumulative Return (Long-Short)', fontsize=13)
+            plt.xlabel('Date')
+            plt.ylabel('Cumulative Return')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            out_ls = os.path.join(output_dir, f"{prefix}_decile_cum_LS.png")
+            plt.tight_layout()
+            plt.savefig(out_ls, dpi=150)
+            plt.close()
+
+        print(f"Saved plots to: {output_dir}")
+        return self
+
+
+def main():
+    """主函数"""
+    import argparse
+    import os
+    from pathlib import Path
+    _root = Path(__file__).resolve().parents[2]
+    os.chdir(_root)
+
+    parser = argparse.ArgumentParser(description='Factor Rank IC Analysis Tool')
+    parser.add_argument('--factor', type=str, required=True,
+                       help='Factor file path (e.g., factors_by_type/alpha101/WorldQuant_alpha014.pkl)')
+    parser.add_argument('--data', type=str, default='data.pkl',
+                       help='Market data file path (default: data.pkl)')
+    parser.add_argument('--no-filter-st', action='store_true',
+                       help='Do not exclude ST stocks')
+    parser.add_argument('--no-filter-limit-up', action='store_true',
+                       help='Do not exclude limit-up stocks')
+    parser.add_argument('--no-filter-limit-down', action='store_true',
+                       help='Do not exclude limit-down stocks')
+    parser.add_argument('--no-filter-suspended', action='store_true',
+                       help='Do not exclude suspended stocks')
+    parser.add_argument('--next-day', action='store_true',
+                       help='Use next day return (forward-looking)')
+    parser.add_argument('--output', type=str, default=None,
+                       help='Output file path (default: auto-generated)')
+    parser.add_argument('--workers', type=int, default=None,
+                       help='Number of parallel workers for IC/backtest')
+    parser.add_argument('--backtest-decile', action='store_true',
+                       help='Run decile portfolio backtest with long-short output')
+    parser.add_argument('--no-filter-st-bt', action='store_true',
+                       help='(Backtest) Do not exclude ST stocks')
+    parser.add_argument('--no-filter-limit-up-bt', action='store_true',
+                       help='(Backtest) Do not exclude limit-up stocks')
+    parser.add_argument('--no-filter-limit-down-bt', action='store_true',
+                       help='(Backtest) Do not exclude limit-down stocks')
+    parser.add_argument('--no-filter-suspended-bt', action='store_true',
+                       help='(Backtest) Do not exclude suspended stocks')
+    parser.add_argument('--no-next-day-bt', action='store_true',
+                       help='(Backtest) Use same-day returns instead of next-day')
+    parser.add_argument('--backtest-output-dir', type=str, default=None,
+                       help='Directory to save backtest results (default: backtest_results)')
+    parser.add_argument('--plot-backtest', action='store_true',
+                       help='Plot cumulative returns of decile backtest')
+    parser.add_argument('--plot-input', type=str, default=None,
+                       help='Optional: cumulative returns csv to plot (overrides in-memory)')
+    parser.add_argument('--plot-output-dir', type=str, default=None,
+                       help='Directory to save plots (default: backtest_plots)')
+    
+    args = parser.parse_args()
+    
+    # 执行分析
+    analyzer = FactorRankICAnalyzer(args.data)
+    analyzer.load_market_data() \
+            .load_factor(args.factor) \
+            .merge_data() \
+            .calculate_rank_ic(
+                exclude_st=not args.no_filter_st,
+                exclude_limit_up=not args.no_filter_limit_up,
+                exclude_limit_down=not args.no_filter_limit_down,
+                exclude_suspended=not args.no_filter_suspended,
+                use_next_day_return=args.next_day,
+                workers=args.workers
+            ) \
+            .print_statistics() \
+            .save_results(args.output)
+
+    if args.backtest_decile:
+        analyzer.backtest_deciles(
+            n_bins=10,
+            exclude_st=not args.no_filter_st_bt,
+            exclude_limit_up=not args.no_filter_limit_up_bt,
+            exclude_limit_down=not args.no_filter_limit_down_bt,
+            exclude_suspended=not args.no_filter_suspended_bt,
+            use_next_day_return=not args.no_next_day_bt,
+            workers=args.workers
+        ).save_backtest(output_dir=args.backtest_output_dir)
+
+    if args.plot_backtest:
+        analyzer.plot_backtest_cumulative(
+            from_file=args.plot_input,
+            output_dir=args.plot_output_dir,
+            prefix=getattr(analyzer, 'factor_name', 'factor')
+        )
+    
+    print("\nAnalysis completed successfully!")
+
+
+if __name__ == "__main__":
+    # 如果没有命令行参数，使用交互模式
+    import sys
+    import os
+    from pathlib import Path
+    os.chdir(Path(__file__).resolve().parents[2])
+
+    if len(sys.argv) == 1:
+        print("="*80)
+        print("Factor Rank IC Analysis Tool - Interactive Mode")
+        print("="*80)
+        
+        # 示例使用
+        factor_file = 'factors_by_type/alpha101/WorldQuant_alpha002.pkl'
+        
+        print(f"\nExample: Analyzing factor {factor_file}")
+        
+        analyzer = FactorRankICAnalyzer('data.pkl')
+        analyzer.load_market_data() \
+                .load_factor(factor_file) \
+                .merge_data() \
+                .calculate_rank_ic(
+                    exclude_st=True,
+                    exclude_limit_up=True,
+                    exclude_limit_down=True,
+                    exclude_suspended=True,
+                    use_next_day_return=True
+                ) \
+                .print_statistics() \
+                .save_results()
+
+        # 示例：运行10分位回测（可注释）
+        analyzer.backtest_deciles(
+            n_bins=10,
+            exclude_st=True,
+            exclude_limit_up=True,
+            exclude_limit_down=True,
+            exclude_suspended=True,
+            use_next_day_return=True
+        ).save_backtest()
+        
+        # print("\nExample analysis completed!")
+        # print("\nFor command line usage:")
+        # print("  python factor_rankic_analysis.py --factor <factor_file> [options]")
+        # print("\nOptions:")
+        # print("  --no-filter-st          : Do not exclude ST stocks")
+        # print("  --no-filter-limit-up    : Do not exclude limit-up stocks")
+        # print("  --no-filter-limit-down  : Do not exclude limit-down stocks")
+        # print("  --no-filter-suspended   : Do not exclude suspended stocks")
+        # print("  --next-day              : Use next day return")
+        # print("  --output <file>         : Output file path")
+    else:
+        main()
+

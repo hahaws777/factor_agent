@@ -45,3 +45,7 @@ generated_factors/
 
 # Pickle artifacts under this package (data.pkl lives at parent project root)
 *.pkl
+
+# Large / local dumps (uncomment if you keep these next to the code)
+# *.csv
+# *.npz
