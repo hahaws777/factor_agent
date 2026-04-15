@@ -42,6 +42,12 @@ python agent/factor_agent_pipeline.py -d "Your factor description" --data data.p
 streamlit run agent/ui/streamlit_app.py
 ```
 
+## Demo Video
+
+Project demo video:
+
+[Watch demo video](./dbe7618914e497eec52ffa3b81c2d99f_raw.mp4)
+
 ## Analysis Scripts
 
 Single-factor Rank IC analysis:
