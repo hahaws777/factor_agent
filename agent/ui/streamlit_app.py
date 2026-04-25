@@ -11,6 +11,7 @@ Run from project root:
 
 from __future__ import annotations
 
+import multiprocessing
 import os
 import subprocess
 import sys
@@ -258,6 +259,17 @@ def main():
             value=st.session_state.artifact_default,
             key="sb_art",
         )
+        _nc = int(multiprocessing.cpu_count() or 4)
+        _w_max = min(32, max(4, _nc))
+        _w_default = max(1, min(8, _nc))
+        st.slider(
+            "Parallel workers (Rank IC + decile)",
+            min_value=1,
+            max_value=_w_max,
+            value=_w_default,
+            key="sb_pipeline_workers",
+            help="Per-trading-day IC/decile tasks run in a process pool when >1. Factor pickle step stays single-process.",
+        )
         st.divider()
         st.subheader("Export & run")
         save_name = st.text_input("Save as (.py)", value=st.session_state.save_stub, key="sb_save")
@@ -292,6 +304,9 @@ def main():
                     "--artifact-dir",
                     artifact_dir,
                 ]
+                _workers = int(st.session_state.get("sb_pipeline_workers", _w_default))
+                if _workers > 1:
+                    cmd.extend(["--workers", str(_workers)])
                 with st.spinner("Running pipeline…"):
                     proc = subprocess.run(
                         cmd,
