@@ -160,6 +160,36 @@ def _render_pipeline_artifacts(art: Path) -> None:
                         st.text(str(c))
 
 
+def _render_batch_artifacts(out_dir: Path) -> None:
+    import pandas as pd
+
+    st.subheader("Batch analysis results")
+    try:
+        out_rel = out_dir.relative_to(ROOT)
+    except ValueError:
+        out_rel = out_dir
+    st.caption(f"Output folder: `{out_rel}`")
+    summary_path = out_dir / "summary.csv"
+    if not summary_path.is_file():
+        st.info("No `summary.csv` found in this folder yet.")
+        return
+    try:
+        df = pd.read_csv(summary_path)
+    except Exception as e:
+        st.warning(f"Could not read summary.csv: {e}")
+        return
+    st.markdown("**Batch summary (top by Rank IC IR)**")
+    show = df.copy()
+    if "rank_ic_ir" in show.columns:
+        show["rank_ic_ir"] = pd.to_numeric(show["rank_ic_ir"], errors="coerce")
+        show = show.sort_values("rank_ic_ir", ascending=False, na_position="last")
+    cols = [c for c in ["factor_name", "mean_rank_ic", "rank_ic_ir", "rank_ic_win_rate", "valid_days", "elapsed_sec", "error"] if c in show.columns]
+    if cols:
+        st.dataframe(show[cols].head(200), use_container_width=True)
+    else:
+        st.dataframe(show.head(200), use_container_width=True)
+
+
 def _stream_assistant(messages: list, model: str, temperature: float):
     from openai import OpenAI
 
@@ -200,6 +230,10 @@ def main():
         st.session_state.sb_model = "gpt-4.1"
     if "sb_temp" not in st.session_state:
         st.session_state.sb_temp = 0.2
+    if "batch_factor_dir" not in st.session_state:
+        st.session_state.batch_factor_dir = "factors_by_type"
+    if "batch_out_dir" not in st.session_state:
+        st.session_state.batch_out_dir = f"rankic_batch_results"
 
     st.title("Factor Agent")
     st.caption("Chat · generate `compute_factor_df()` · optional Rank IC / decile backtest")
@@ -262,8 +296,20 @@ def main():
         _nc = int(multiprocessing.cpu_count() or 4)
         _w_max = min(32, max(4, _nc))
         _w_default = max(1, min(8, _nc))
+        st.selectbox(
+            "Rank IC backend",
+            ["pandas", "torch"],
+            key="sb_pipeline_backend",
+            help="pandas: default CPU path; torch: supports CUDA/CPU device selection.",
+        )
+        st.text_input(
+            "Torch device",
+            value="auto",
+            key="sb_pipeline_device",
+            help="Used when backend=torch. Example: auto / cuda / cuda:0 / cpu",
+        )
         st.slider(
-            "Parallel workers (Rank IC + decile)",
+            "Parallel workers (Level-2: per-day IC/decile)",
             min_value=1,
             max_value=_w_max,
             value=_w_default,
@@ -307,6 +353,9 @@ def main():
                 _workers = int(st.session_state.get("sb_pipeline_workers", _w_default))
                 if _workers > 1:
                     cmd.extend(["--workers", str(_workers)])
+                _backend = str(st.session_state.get("sb_pipeline_backend", "pandas"))
+                _device = str(st.session_state.get("sb_pipeline_device", "auto")).strip() or "auto"
+                cmd.extend(["--backend", _backend, "--device", _device])
                 with st.spinner("Running pipeline…"):
                     proc = subprocess.run(
                         cmd,
@@ -323,6 +372,83 @@ def main():
                 else:
                     st.error(f"Exit code {proc.returncode}")
         st.divider()
+        st.subheader("Batch analysis (multi-level parallel)")
+        batch_factor_dir = st.text_input(
+            "Factor dir",
+            value=st.session_state.batch_factor_dir,
+            key="batch_factor_dir",
+        )
+        batch_out_dir = st.text_input(
+            "Batch output dir",
+            value=st.session_state.batch_out_dir,
+            key="batch_out_dir",
+        )
+        st.selectbox(
+            "Batch backend",
+            ["pandas", "torch"],
+            key="batch_backend",
+            help="Applied to each factor's Rank IC computation.",
+        )
+        st.text_input(
+            "Batch torch device",
+            value="auto",
+            key="batch_device",
+        )
+        st.slider(
+            "Factor workers (Level-1: cross-factor parallel)",
+            min_value=1,
+            max_value=_w_max,
+            value=max(1, min(4, _w_default)),
+            key="batch_factor_workers",
+            help="Run multiple factor files in parallel.",
+        )
+        st.slider(
+            "IC workers (Level-2: per-factor/day parallel)",
+            min_value=1,
+            max_value=_w_max,
+            value=_w_default,
+            key="batch_ic_workers",
+            help="Workers used inside each factor for per-day IC/decile tasks.",
+        )
+        if st.button("Run batch analysis", use_container_width=True):
+            batch_script = ROOT / "scripts" / "analysis" / "batch_factor_analysis.py"
+            _factor_workers = int(st.session_state.get("batch_factor_workers", 1))
+            _ic_workers = int(st.session_state.get("batch_ic_workers", _w_default))
+            _batch_backend = str(st.session_state.get("batch_backend", "pandas"))
+            _batch_device = str(st.session_state.get("batch_device", "auto")).strip() or "auto"
+            cmd = [
+                sys.executable,
+                str(batch_script),
+                batch_factor_dir,
+                "--output-dir",
+                batch_out_dir,
+                "--data",
+                data_pkl,
+                "--factor-workers",
+                str(_factor_workers),
+                "--ic-workers",
+                str(_ic_workers),
+                "--backend",
+                _batch_backend,
+                "--device",
+                _batch_device,
+            ]
+            with st.spinner("Running batch analysis…"):
+                proc = subprocess.run(
+                    cmd,
+                    cwd=str(ROOT),
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+            st.code(proc.stdout + ("\n" + proc.stderr if proc.stderr else ""), language="text")
+            if proc.returncode == 0:
+                st.success("Batch analysis finished OK.")
+                st.session_state["batch_artifact_dir"] = str(_resolve_artifact_dir(batch_out_dir))
+            else:
+                st.error(f"Exit code {proc.returncode}")
+        st.divider()
         if st.button("New conversation", use_container_width=True):
             st.session_state.messages = []
             st.rerun()
@@ -335,6 +461,13 @@ def main():
         if art_show.is_dir():
             st.divider()
             _render_pipeline_artifacts(art_show)
+
+    batch_key = st.session_state.get("batch_artifact_dir")
+    if batch_key:
+        batch_show = Path(batch_key)
+        if batch_show.is_dir():
+            st.divider()
+            _render_batch_artifacts(batch_show)
 
 
 if __name__ == "__main__":

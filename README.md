@@ -42,6 +42,11 @@ python agent/factor_agent_pipeline.py -d "Your factor description" --data data.p
 streamlit run agent/ui/streamlit_app.py
 ```
 
+The UI now supports multi-level parallel controls:
+- Level-2 per-day IC workers for pipeline runs
+- Batch mode with Level-1 factor workers + Level-2 IC workers
+- Backend/device selection (`pandas` or `torch`, with `cuda/cpu/auto`)
+
 ## Demo Video
 
 Project demo video:
@@ -60,6 +65,7 @@ Batch analysis:
 
 ```bash
 python scripts/analysis/batch_factor_analysis.py factors_by_type/alpha101
+python scripts/analysis/batch_factor_analysis.py factors_by_type/alpha101 --output-dir rankic_batch_results --factor-workers 4 --ic-workers 8 --backend pandas
 ```
 
 ## Repository Structure

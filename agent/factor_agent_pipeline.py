@@ -102,6 +102,8 @@ def run_rank_ic_backtest(
     backtest_output_dir: Path | None,
     plot_output_dir: Path | None,
     workers: int | None,
+    backend: str,
+    device: str,
 ) -> int:
     ana = ROOT / "scripts" / "analysis" / "factor_rankic_analysis.py"
     cmd = [
@@ -126,6 +128,10 @@ def run_rank_ic_backtest(
         cmd.extend(["--plot-output-dir", str(plot_output_dir)])
     if workers is not None:
         cmd.extend(["--workers", str(workers)])
+    if backend:
+        cmd.extend(["--backend", str(backend)])
+    if device:
+        cmd.extend(["--device", str(device)])
     print("Running:", " ".join(cmd), flush=True)
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
@@ -158,6 +164,8 @@ def main():
     p.add_argument("--no-backtest", action="store_true", help="Skip decile backtest step")
     p.add_argument("--no-plot-backtest", action="store_true", help="Skip decile cumulative plots (default: plot when backtest runs)")
     p.add_argument("--workers", type=int, default=None)
+    p.add_argument("--backend", type=str, default="pandas", choices=["pandas", "torch"], help="IC backend")
+    p.add_argument("--device", type=str, default="auto", help="Torch device when --backend torch")
     args = p.parse_args()
 
     skip = args.skip_generate.strip()
@@ -257,6 +265,8 @@ def main():
         backtest_output_dir=bt_out,
         plot_output_dir=plot_out,
         workers=args.workers,
+        backend=args.backend,
+        device=args.device,
     )
     return rc
 

@@ -49,3 +49,10 @@ streamlit run agent/ui/streamlit_app.py
 ```
 
 Opens a browser (default `http://localhost:8501`): multi-turn chat, streaming replies, save generated code to `generated_factors/`, and one-click **Run pipeline** (pickle + Rank IC + decile + plots) using `factor_agent_pipeline.py`. After a successful run, **scroll below the chat**: the main column shows **Rank IC metrics**, a **daily IC line chart**, and **decile PNGs** from `backtest_plots/` (this block renders after the sidebar updates session state).
+
+### Multi-level parallel in UI
+
+- Pipeline panel: configure Level-2 per-day IC workers + backend/device (`pandas` / `torch` + `auto/cuda/cpu`)
+- Batch panel: run `scripts/analysis/batch_factor_analysis.py` with:
+  - Level-1 `factor-workers` (cross-factor parallel)
+  - Level-2 `ic-workers` (inside each factor/day IC parallel)

@@ -16,6 +16,11 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
 import matplotlib.pyplot as plt
 
+try:
+    import torch
+except Exception:
+    torch = None
+
 def _parallel_ic_calc(args):
     d, g, factor_name = args
     n = len(g)
@@ -41,6 +46,89 @@ def _parallel_decile_calc(args):
     means = g.groupby('bin')['return'].mean()
     return (d, means.to_dict())
 
+
+def _torch_corr(x: "torch.Tensor", y: "torch.Tensor") -> float:
+    """Compute Pearson correlation for two 1D tensors."""
+    x = x.float()
+    y = y.float()
+    xm = x.mean()
+    ym = y.mean()
+    xv = x - xm
+    yv = y - ym
+    den = torch.sqrt(torch.sum(xv * xv) * torch.sum(yv * yv))
+    if torch.isclose(den, torch.tensor(0.0, device=x.device)):
+        return np.nan
+    return float((torch.sum(xv * yv) / den).item())
+
+
+def _torch_rank_dense(x: "torch.Tensor") -> "torch.Tensor":
+    """
+    Dense rank via double argsort (no tie-average adjustment).
+    For most continuous factors/returns this is close to pandas rank.
+    """
+    order = torch.argsort(x)
+    rank = torch.empty_like(order, dtype=torch.float32)
+    rank[order] = torch.arange(1, x.numel() + 1, device=x.device, dtype=torch.float32)
+    return rank
+
+
+def _resolve_torch_device(device: str) -> str:
+    if torch is None:
+        raise ImportError("PyTorch is not installed. Please install torch first.")
+    if device == "auto":
+        if torch.cuda.is_available():
+            return "cuda"
+        return "cpu"
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("CUDA device requested but torch.cuda.is_available() is False.")
+    return device
+
+
+def _torch_calc_rows_by_segments(
+    data: pd.DataFrame,
+    factor_name: str,
+    resolved_device: str,
+):
+    """
+    Torch path: move full columns to device once, then compute per-day slices.
+    This avoids repeated CPU->GPU transfer inside day loops.
+    """
+    if data.empty:
+        return []
+
+    work = data[['date', factor_name, 'return']].sort_values('date')
+    date_arr = work['date'].to_numpy()
+    f_arr = work[factor_name].to_numpy(dtype=np.float32, copy=False)
+    r_arr = work['return'].to_numpy(dtype=np.float32, copy=False)
+
+    if len(work) == 0:
+        return []
+
+    boundaries = np.flatnonzero(date_arr[1:] != date_arr[:-1]) + 1
+    starts = np.r_[0, boundaries]
+    ends = np.r_[boundaries, len(work)]
+    day_vals = date_arr[starts]
+
+    # One-time transfer
+    tf = torch.as_tensor(f_arr, device=resolved_device)
+    tr = torch.as_tensor(r_arr, device=resolved_device)
+
+    rows = []
+    with torch.no_grad():
+        for d, s, e in zip(day_vals, starts, ends):
+            n = int(e - s)
+            if n < 3:
+                rows.append((d, n, np.nan, np.nan))
+                continue
+            x = tf[s:e]
+            y = tr[s:e]
+            ic_val = _torch_corr(x, y)
+            rx = _torch_rank_dense(x)
+            ry = _torch_rank_dense(y)
+            rank_ic_val = _torch_corr(rx, ry)
+            rows.append((d, n, ic_val, rank_ic_val))
+    return rows
+
 class FactorRankICAnalyzer:
     """因子Rank IC分析器"""
     
@@ -53,19 +141,49 @@ class FactorRankICAnalyzer:
         """
         self.data_pkl = data_pkl
         self.market_data = None
+        self.market_data_indexed = None
         self.factor_data = None
         self.merged_data = None
         self.ic_results = None
         self.backtest_daily_returns = None
         self.backtest_cum_returns = None
+
+    def _prepare_market_index(self, copy_data=True):
+        """Prepare cached MultiIndex market table for faster joins."""
+        if self.market_data is None:
+            raise ValueError("Market data is not loaded.")
+        md = self.market_data
+        if copy_data:
+            md = md.copy()
+        md['date'] = pd.to_datetime(md['date']).dt.normalize()
+        md['order_book_id'] = md['order_book_id'].astype(str)
+        self.market_data = md
+        self.market_data_indexed = md.set_index(['order_book_id', 'date']).sort_index()
+        return self
+
+    def set_market_data(self, market_data: pd.DataFrame, market_data_indexed: pd.DataFrame = None):
+        """
+        Set preloaded market data (for batch mode reuse).
+        """
+        self.market_data = market_data
+        if market_data_indexed is not None:
+            self.market_data_indexed = market_data_indexed
+        else:
+            self._prepare_market_index(copy_data=False)
+        return self
         
     def load_market_data(self):
         """加载行情数据"""
+        if self.market_data is not None and self.market_data_indexed is not None:
+            print("Market data already loaded in memory; skip reloading.")
+            return self
+
         print(f"Loading market data from {self.data_pkl}...")
         
         with open(self.data_pkl, 'rb') as f:
             self.market_data = pickle.load(f)
-        
+        self._prepare_market_index()
+
         print(f"Market data loaded: {self.market_data.shape}")
         print(f"Date range: {self.market_data['date'].min()} to {self.market_data['date'].max()}")
         
@@ -92,22 +210,26 @@ class FactorRankICAnalyzer:
     def merge_data(self):
         """合并行情数据和因子数据"""
         print("\nMerging market and factor data...")
+
+        if self.market_data is None:
+            raise ValueError("Please load market data first.")
+        if self.market_data_indexed is None:
+            self._prepare_market_index()
         
         # 确保因子数据有正确的索引
         if not isinstance(self.factor_data.index, pd.MultiIndex):
             print("Error: Factor data must have MultiIndex (order_book_id, date)")
             return self
-        
-        # 重置因子数据索引
-        factor_df = self.factor_data.reset_index()
+
+        # 统一因子索引类型并使用索引 join（比大表列 merge 更省内存/更快）
+        factor_df = self.factor_data.copy()
+        factor_df = factor_df.reset_index()
         factor_df.columns = ['order_book_id', 'date', self.factor_name]
-        
-        # 合并数据
-        self.merged_data = self.market_data.merge(
-            factor_df,
-            on=['order_book_id', 'date'],
-            how='inner'
-        )
+        factor_df['order_book_id'] = factor_df['order_book_id'].astype(str)
+        factor_df['date'] = pd.to_datetime(factor_df['date']).dt.normalize()
+        factor_indexed = factor_df.set_index(['order_book_id', 'date'])[[self.factor_name]]
+
+        self.merged_data = self.market_data_indexed.join(factor_indexed, how='inner').reset_index()
         
         print(f"Merged data shape: {self.merged_data.shape}")
         
@@ -119,7 +241,9 @@ class FactorRankICAnalyzer:
                          exclude_limit_down=True,
                          exclude_suspended=True,
                          use_next_day_return=False,
-                         workers=None):
+                         workers=None,
+                         backend='pandas',
+                         device='auto'):
         """
         计算Rank IC
         
@@ -142,6 +266,9 @@ class FactorRankICAnalyzer:
         print(f"  Exclude Limit Down: {exclude_limit_down}")
         print(f"  Exclude Suspended: {exclude_suspended}")
         print(f"  Use Next Day Return: {use_next_day_return}")
+        print(f"  Backend: {backend}")
+        if backend == 'torch':
+            print(f"  Device: {device}")
         
         # 复制数据
         data = self.merged_data.copy()
@@ -174,20 +301,24 @@ class FactorRankICAnalyzer:
         
         print(f"\nValid records after filtering: {len(data):,}")
         
-        # 按日期分组并行计算
+        # 按日期分组计算
         num_days = data['date'].nunique()
         print(f"\nProcessing {num_days} trading days...")
 
-        # 预分组，避免在子进程里重复过滤
-        grouped = list((d, g[[self.factor_name, 'return']].copy()) for d, g in data.groupby('date', sort=True))
-        tasks = [(d, g, self.factor_name) for d, g in grouped]
-
-        if workers is None or workers <= 1:
-            rows = [_parallel_ic_calc(it) for it in tasks]
+        if backend == 'torch':
+            resolved_device = _resolve_torch_device(device)
+            print(f"Using torch backend on device: {resolved_device}")
+            rows = _torch_calc_rows_by_segments(data, self.factor_name, resolved_device)
         else:
-            max_workers = min(int(workers), max(1, multiprocessing.cpu_count()))
-            with ProcessPoolExecutor(max_workers=max_workers) as ex:
-                rows = list(ex.map(_parallel_ic_calc, tasks, chunksize=1))
+            # 预分组，避免在子进程里重复过滤
+            grouped = list((d, g[[self.factor_name, 'return']].copy()) for d, g in data.groupby('date', sort=True))
+            tasks = [(d, g, self.factor_name) for d, g in grouped]
+            if workers is None or workers <= 1:
+                rows = [_parallel_ic_calc(it) for it in tasks]
+            else:
+                max_workers = min(int(workers), max(1, multiprocessing.cpu_count()))
+                with ProcessPoolExecutor(max_workers=max_workers) as ex:
+                    rows = list(ex.map(_parallel_ic_calc, tasks, chunksize=1))
 
         result = pd.DataFrame(rows, columns=['date', 'n_stocks', 'ic', 'rank_ic'])
 
@@ -532,6 +663,10 @@ def main():
                        help='Output file path (default: auto-generated)')
     parser.add_argument('--workers', type=int, default=None,
                        help='Number of parallel workers for IC/backtest')
+    parser.add_argument('--backend', type=str, default='pandas', choices=['pandas', 'torch'],
+                       help='Compute backend for IC: pandas (default) or torch')
+    parser.add_argument('--device', type=str, default='auto',
+                       help='Torch device when --backend torch (e.g. auto/cuda/cuda:0/cpu)')
     parser.add_argument('--backtest-decile', action='store_true',
                        help='Run decile portfolio backtest with long-short output')
     parser.add_argument('--no-filter-st-bt', action='store_true',
@@ -566,7 +701,9 @@ def main():
                 exclude_limit_down=not args.no_filter_limit_down,
                 exclude_suspended=not args.no_filter_suspended,
                 use_next_day_return=args.next_day,
-                workers=args.workers
+                workers=args.workers,
+                backend=args.backend,
+                device=args.device
             ) \
             .print_statistics() \
             .save_results(args.output)
