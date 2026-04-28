@@ -59,4 +59,6 @@ python scripts\analysis\factor_rankic_analysis.py --factor factors_by_type\alpha
 python scripts\composite\factor_composite_pca_lgb.py --decile_dir decile_cpp_batch_results
 
 python scripts\download\download_factors_by_type_priority.py
+
+python scripts\analysis\factor_compare_dashboard.py --new-rankic rankic_batch_results\alpha101_WorldQuant_alpha016_rankic.csv --baseline-summary rankic_batch_results\summary.csv --baseline-daily-dir rankic_batch_results --out-dir factor_compare_output\alpha016
 ```
