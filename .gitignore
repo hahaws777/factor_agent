@@ -30,6 +30,7 @@ decile_cpp_results/
 rankic_batch_results/
 rankic_cpp_batch_results/
 factor_composite_output/
+factor_compare_output/
 
 # Large data files (do not upload)
 *.csv
@@ -40,6 +41,8 @@ factor_composite_output/
 *.gif
 *.pdf
 *.svg
+*.json
+*.jsonl
 *.pkl
 *.npz
 *.npy
