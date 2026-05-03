@@ -56,3 +56,7 @@ Opens a browser (default `http://localhost:8501`): multi-turn chat, streaming re
 - Batch panel: run `scripts/analysis/batch_factor_analysis.py` with:
   - Level-1 `factor-workers` (cross-factor parallel)
   - Level-2 `ic-workers` (inside each factor/day IC parallel)
+
+### Run metadata
+
+Pipeline runs now write `run_metadata.json` automatically in the artifact directory (or to a custom path via `--metadata-out`).

@@ -68,6 +68,14 @@ python scripts/analysis/batch_factor_analysis.py factors_by_type/alpha101
 python scripts/analysis/batch_factor_analysis.py factors_by_type/alpha101 --output-dir rankic_batch_results --factor-workers 4 --ic-workers 8 --backend pandas
 ```
 
+## Run Metadata
+
+Core workflows now write `run_metadata.json` automatically (unless overridden by CLI):
+
+- `agent/factor_agent_pipeline.py` → `<artifact_dir>/run_metadata.json`
+- `scripts/analysis/batch_factor_analysis.py` → `<output_dir>/run_metadata.json`
+- `scripts/analysis/factor_compare_dashboard.py` → `<out_dir>/run_metadata.json`
+
 ## Repository Structure
 
 - `agent/`: factor code generation, pipeline, Streamlit UI

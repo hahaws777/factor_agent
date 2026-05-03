@@ -53,6 +53,7 @@ Notes:
 
 - If `factor-workers > 1` and `ic-workers > 1`, this is true two-level parallelism and may oversubscribe CPU.
 - If using torch backend, prefer `--device cuda` on NVIDIA GPU.
+- Batch run metadata is saved to `<output-dir>/run_metadata.json` (custom path: `--metadata-out`).
 
 ## Folder index
 
@@ -90,3 +91,8 @@ Measured on this workspace data (`data.pkl` + `random_noise_factor.pkl`):
 - Torch CUDA RankIC vs pandas RankIC (single factor, 503 days): both around `~17.6s` in current pipeline
 
 Actual speed depends on factor sparsity, date span, CPU/GPU load, and storage bandwidth.
+
+## Run metadata outputs
+
+- `batch_factor_analysis.py`: `<output-dir>/run_metadata.json` (or `--metadata-out`)
+- `factor_compare_dashboard.py`: `<out-dir>/run_metadata.json` (or `--metadata-out`)

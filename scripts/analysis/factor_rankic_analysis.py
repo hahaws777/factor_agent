@@ -5,6 +5,7 @@
 支持过滤ST股票、涨跌停股票
 """
 
+import logging
 import pandas as pd
 import numpy as np
 import pickle
@@ -20,6 +21,12 @@ try:
     import torch
 except Exception:
     torch = None
+
+log = logging.getLogger(__name__)
+
+MIN_STOCKS_PER_DAY = 50        # days with fewer stocks are dropped from IC
+IC_VALID_BOUND = 1 - 1e-6      # |IC| must be below this to compute p-value
+MIN_MERGE_OVERLAP = 0.05       # warn if merged rows < this fraction of factor rows
 
 def _parallel_ic_calc(args):
     d, g, factor_name = args
@@ -175,53 +182,50 @@ class FactorRankICAnalyzer:
     def load_market_data(self):
         """加载行情数据"""
         if self.market_data is not None and self.market_data_indexed is not None:
-            print("Market data already loaded in memory; skip reloading.")
+            log.info("Market data already loaded in memory; skip reloading.")
             return self
 
-        print(f"Loading market data from {self.data_pkl}...")
-        
+        log.info("Loading market data from %s...", self.data_pkl)
+        if not os.path.isfile(self.data_pkl):
+            raise FileNotFoundError(f"Market data file not found: {self.data_pkl}")
+
         with open(self.data_pkl, 'rb') as f:
             self.market_data = pickle.load(f)
         self._prepare_market_index()
 
-        print(f"Market data loaded: {self.market_data.shape}")
-        print(f"Date range: {self.market_data['date'].min()} to {self.market_data['date'].max()}")
-        
+        log.info("Market data loaded: shape=%s  date range: %s to %s",
+                 self.market_data.shape,
+                 self.market_data['date'].min(),
+                 self.market_data['date'].max())
         return self
     
     def load_factor(self, factor_file):
-        """
-        加载因子数据
-        
-        参数:
-            factor_file: 因子文件路径
-        """
-        print(f"\nLoading factor from {factor_file}...")
-        
+        """加载因子数据"""
+        log.info("Loading factor from %s...", factor_file)
+        if not os.path.isfile(factor_file):
+            raise FileNotFoundError(f"Factor file not found: {factor_file}")
+
         self.factor_data = pd.read_pickle(factor_file)
         self.factor_name = self.factor_data.columns[0]
-        
-        print(f"Factor loaded: {self.factor_data.shape}")
-        print(f"Factor name: {self.factor_name}")
-        print(f"Non-null ratio: {self.factor_data[self.factor_name].notna().mean()*100:.2f}%")
-        
+
+        log.info("Factor loaded: shape=%s  name=%r  non-null=%.2f%%",
+                 self.factor_data.shape,
+                 self.factor_name,
+                 self.factor_data[self.factor_name].notna().mean() * 100)
         return self
     
     def merge_data(self):
         """合并行情数据和因子数据"""
-        print("\nMerging market and factor data...")
+        log.info("Merging market and factor data...")
 
         if self.market_data is None:
             raise ValueError("Please load market data first.")
         if self.market_data_indexed is None:
             self._prepare_market_index()
-        
-        # 确保因子数据有正确的索引
-        if not isinstance(self.factor_data.index, pd.MultiIndex):
-            print("Error: Factor data must have MultiIndex (order_book_id, date)")
-            return self
 
-        # 统一因子索引类型并使用索引 join（比大表列 merge 更省内存/更快）
+        if not isinstance(self.factor_data.index, pd.MultiIndex):
+            raise ValueError("Factor data must have MultiIndex (order_book_id, date)")
+
         factor_df = self.factor_data.copy()
         factor_df = factor_df.reset_index()
         factor_df.columns = ['order_book_id', 'date', self.factor_name]
@@ -230,9 +234,13 @@ class FactorRankICAnalyzer:
         factor_indexed = factor_df.set_index(['order_book_id', 'date'])[[self.factor_name]]
 
         self.merged_data = self.market_data_indexed.join(factor_indexed, how='inner').reset_index()
-        
-        print(f"Merged data shape: {self.merged_data.shape}")
-        
+
+        overlap = len(self.merged_data) / max(len(factor_df), 1)
+        if overlap < MIN_MERGE_OVERLAP:
+            log.warning("Low merge overlap: %.1f%% of factor rows matched market data. "
+                        "Check date formats and stock ID conventions.", overlap * 100)
+
+        log.info("Merged data shape: %s", self.merged_data.shape)
         return self
     
     def calculate_rank_ic(self, 
@@ -257,18 +265,11 @@ class FactorRankICAnalyzer:
         返回:
             IC分析结果DataFrame
         """
-        print("\n" + "="*80)
-        print("Calculating Rank IC")
-        print("="*80)
-        print(f"Filter Config:")
-        print(f"  Exclude ST: {exclude_st}")
-        print(f"  Exclude Limit Up: {exclude_limit_up}")
-        print(f"  Exclude Limit Down: {exclude_limit_down}")
-        print(f"  Exclude Suspended: {exclude_suspended}")
-        print(f"  Use Next Day Return: {use_next_day_return}")
-        print(f"  Backend: {backend}")
-        if backend == 'torch':
-            print(f"  Device: {device}")
+        log.info("Calculating Rank IC | exclude_st=%s limit_up=%s limit_down=%s "
+                 "suspended=%s next_day=%s backend=%s%s",
+                 exclude_st, exclude_limit_up, exclude_limit_down,
+                 exclude_suspended, use_next_day_return, backend,
+                 f" device={device}" if backend == 'torch' else "")
         
         # 复制数据
         data = self.merged_data.copy()
@@ -299,15 +300,14 @@ class FactorRankICAnalyzer:
         # 去除无效数据
         data = data.dropna(subset=[self.factor_name, 'return'])
         
-        print(f"\nValid records after filtering: {len(data):,}")
-        
-        # 按日期分组计算
+        log.info("Valid records after filtering: %d", len(data))
+
         num_days = data['date'].nunique()
-        print(f"\nProcessing {num_days} trading days...")
+        log.info("Processing %d trading days...", num_days)
 
         if backend == 'torch':
             resolved_device = _resolve_torch_device(device)
-            print(f"Using torch backend on device: {resolved_device}")
+            log.info("Using torch backend on device: %s", resolved_device)
             rows = _torch_calc_rows_by_segments(data, self.factor_name, resolved_device)
         else:
             # 预分组，避免在子进程里重复过滤
@@ -322,31 +322,36 @@ class FactorRankICAnalyzer:
 
         result = pd.DataFrame(rows, columns=['date', 'n_stocks', 'ic', 'rank_ic'])
 
-        # 仅保留样本数>=50的交易日
-        result = result[result['n_stocks'] >= 50].copy()
+        result = result[result['n_stocks'] >= MIN_STOCKS_PER_DAY].copy()
 
-        # 近似p值（基于t分布近似）：t = r * sqrt((n-2)/(1-r^2))
-        # 这里对rank_ic计算p值
-        valid = (result['rank_ic'].notna()) & (result['rank_ic'] > -0.999999) & (result['rank_ic'] < 0.999999) & (result['n_stocks'] > 2)
+        valid = (
+            result['rank_ic'].notna() &
+            (result['rank_ic'].abs() < IC_VALID_BOUND) &
+            (result['n_stocks'] > 2)
+        )
         t_stat = np.full(len(result), np.nan, dtype=float)
         df = result.loc[valid, 'n_stocks'].values - 2
         r = result.loc[valid, 'rank_ic'].values
-        t_stat_valid = np.abs(r) * np.sqrt((df) / (1 - r * r))
+        t_stat_valid = np.abs(r) * np.sqrt(df / (1 - r * r))
         t_stat[valid.values] = t_stat_valid
         p_val = np.full(len(result), np.nan, dtype=float)
         p_val[valid.values] = 2 * student_t.sf(t_stat_valid, df)
         result['p_value'] = p_val
 
-        # 对Pearson IC计算p值，新增列 ic_p_value（不改变原有列名以保持兼容）
-        valid_ic = (result['ic'].notna()) & (result['ic'] > -0.999999) & (result['ic'] < 0.999999) & (result['n_stocks'] > 2)
+        valid_ic = (
+            result['ic'].notna() &
+            (result['ic'].abs() < IC_VALID_BOUND) &
+            (result['n_stocks'] > 2)
+        )
         df_ic = result.loc[valid_ic, 'n_stocks'].values - 2
         r_ic = result.loc[valid_ic, 'ic'].values
-        t_stat_ic = np.abs(r_ic) * np.sqrt((df_ic) / (1 - r_ic * r_ic))
+        t_stat_ic = np.abs(r_ic) * np.sqrt(df_ic / (1 - r_ic * r_ic))
         p_val_ic = np.full(len(result), np.nan, dtype=float)
         p_val_ic[valid_ic.values] = 2 * student_t.sf(t_stat_ic, df_ic)
         result['ic_p_value'] = p_val_ic
 
-        # 填充ic/rank_ic中的NaN为0以与原逻辑一致
+        # NaN IC days (torch path may produce NaN for degenerate slices) → 0
+        # so that downstream mean/std are computed over all valid days consistently.
         result['ic'] = result['ic'].fillna(0)
         result['rank_ic'] = result['rank_ic'].fillna(0)
 
@@ -354,7 +359,7 @@ class FactorRankICAnalyzer:
         result['date'] = pd.to_datetime(result['date'])
         self.ic_results = result[['date', 'ic', 'rank_ic', 'p_value', 'ic_p_value', 'n_stocks']].sort_values('date')
         
-        print(f"\nCalculated IC for {len(self.ic_results)} valid days")
+        log.info("Calculated IC for %d valid days", len(self.ic_results))
         
         return self
     
@@ -730,10 +735,10 @@ def main():
 
 
 if __name__ == "__main__":
-    # 如果没有命令行参数，使用交互模式
     import sys
     import os
     from pathlib import Path
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     os.chdir(Path(__file__).resolve().parents[2])
 
     if len(sys.argv) == 1:

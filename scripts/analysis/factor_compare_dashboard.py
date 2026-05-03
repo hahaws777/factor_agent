@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -48,6 +49,22 @@ def _safe_float(v: float) -> float:
     if np.isfinite(x):
         return x
     return np.nan
+
+
+def _json_safe(obj):
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, (np.floating, float)):
+        if np.isnan(obj) or np.isinf(obj):
+            return None
+        return float(obj)
+    if isinstance(obj, (np.integer, int)):
+        return int(obj)
+    return obj
 
 
 def infer_factor_name(path: Path) -> str:
@@ -310,6 +327,9 @@ def recommend(
 
 
 def main() -> int:
+    t0 = time.perf_counter()
+    ts0 = pd.Timestamp.now(tz='UTC')
+    run_id = f"factor_compare_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}"
     parser = argparse.ArgumentParser(description="Compare new factor with baseline factors and output dashboard artifacts.")
     parser.add_argument("--new-rankic", type=str, required=True, help="Path to new factor daily rankic csv")
     parser.add_argument("--baseline-summary", type=str, default="rankic_batch_results/summary.csv", help="Baseline summary csv")
@@ -318,6 +338,7 @@ def main() -> int:
     parser.add_argument("--top-k", type=int, default=20, help="Top K baseline factors for correlation heatmap")
     parser.add_argument("--segments", type=int, default=4, help="Number of time segments for stability analysis")
     parser.add_argument("--out-dir", type=str, default="factor_compare_output", help="Output directory")
+    parser.add_argument("--metadata-out", type=str, default="", help="Optional metadata json output path")
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parents[2]
@@ -325,139 +346,195 @@ def main() -> int:
     if not out_dir.is_absolute():
         out_dir = (root / out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    metadata_out = Path(args.metadata_out) if args.metadata_out else (out_dir / "run_metadata.json")
+    if not metadata_out.is_absolute():
+        metadata_out = (root / metadata_out).resolve()
 
-    new_rankic_path = Path(args.new_rankic)
-    if not new_rankic_path.is_absolute():
-        new_rankic_path = (root / new_rankic_path).resolve()
-    if not new_rankic_path.exists():
-        raise FileNotFoundError(f"New factor rankic csv not found: {new_rankic_path}")
-
-    baseline_summary_path = Path(args.baseline_summary)
-    if not baseline_summary_path.is_absolute():
-        baseline_summary_path = (root / baseline_summary_path).resolve()
-    if not baseline_summary_path.exists():
-        raise FileNotFoundError(f"Baseline summary not found: {baseline_summary_path}")
-
-    baseline_daily_dir = Path(args.baseline_daily_dir)
-    if not baseline_daily_dir.is_absolute():
-        baseline_daily_dir = (root / baseline_daily_dir).resolve()
-    if not baseline_daily_dir.exists():
-        raise FileNotFoundError(f"Baseline daily dir not found: {baseline_daily_dir}")
-
-    baseline_summary = load_baseline_summary(baseline_summary_path)
-    new_daily = load_rankic_daily(new_rankic_path)
-    raw_name = args.factor_name.strip() or infer_factor_name(new_rankic_path)
-    factor_name = resolve_factor_name(raw_name, baseline_summary["factor_name"].astype(str).tolist())
-    new_stats = calc_stats(factor_name, new_daily)
-    before_rank = rank_table(baseline_summary)
-    existed_before = factor_name in set(before_rank["factor_name"].astype(str))
-    old_rank = None
-    if existed_before:
-        old_rank = int(before_rank.loc[before_rank["factor_name"] == factor_name, "rank_ir"].iloc[0])
-
-    row_data = {c: np.nan for c in baseline_summary.columns}
-    row_data.update(
-        {
-            "factor_name": new_stats.factor_name,
-            "mean_rank_ic": new_stats.mean_rank_ic,
-            "rank_ic_std": new_stats.rank_ic_std,
-            "rank_ic_ir": new_stats.rank_ic_ir,
-            "rank_ic_win_rate": new_stats.rank_ic_win_rate,
-            "valid_days": new_stats.valid_days,
+    def save_meta(status: str, error: str = "", extra: dict | None = None):
+        ts1 = pd.Timestamp.now(tz='UTC')
+        payload = {
+            "run_id": run_id,
+            "status": status,
+            "script": "scripts/analysis/factor_compare_dashboard.py",
+            "started_at_utc": ts0.isoformat(),
+            "ended_at_utc": ts1.isoformat(),
+            "runtime_sec": float(time.perf_counter() - t0),
+            "inputs": {
+                "new_rankic": str(args.new_rankic),
+                "baseline_summary": str(args.baseline_summary),
+                "baseline_daily_dir": str(args.baseline_daily_dir),
+                "factor_name": str(args.factor_name),
+                "top_k": int(args.top_k),
+                "segments": int(args.segments),
+                "out_dir": str(out_dir),
+            },
+            "error": error or None,
         }
-    )
-    row = pd.DataFrame([row_data], columns=baseline_summary.columns)
-    merged = baseline_summary[baseline_summary["factor_name"] != factor_name].copy()
-    merged = pd.concat([merged, row], ignore_index=True)
-    after_rank = rank_table(merged)
-    new_rank = int(after_rank.loc[after_rank["factor_name"] == factor_name, "rank_ir"].iloc[0])
+        if extra:
+            payload.update(extra)
+        metadata_out.parent.mkdir(parents=True, exist_ok=True)
+        metadata_out.write_text(json.dumps(_json_safe(payload), ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"Run metadata saved to: {metadata_out}")
 
-    ranking_change = pd.DataFrame(
-        [
+    try:
+        new_rankic_path = Path(args.new_rankic)
+        if not new_rankic_path.is_absolute():
+            new_rankic_path = (root / new_rankic_path).resolve()
+        if not new_rankic_path.exists():
+            raise FileNotFoundError(f"New factor rankic csv not found: {new_rankic_path}")
+
+        baseline_summary_path = Path(args.baseline_summary)
+        if not baseline_summary_path.is_absolute():
+            baseline_summary_path = (root / baseline_summary_path).resolve()
+        if not baseline_summary_path.exists():
+            raise FileNotFoundError(f"Baseline summary not found: {baseline_summary_path}")
+
+        baseline_daily_dir = Path(args.baseline_daily_dir)
+        if not baseline_daily_dir.is_absolute():
+            baseline_daily_dir = (root / baseline_daily_dir).resolve()
+        if not baseline_daily_dir.exists():
+            raise FileNotFoundError(f"Baseline daily dir not found: {baseline_daily_dir}")
+
+        baseline_summary = load_baseline_summary(baseline_summary_path)
+        new_daily = load_rankic_daily(new_rankic_path)
+        raw_name = args.factor_name.strip() or infer_factor_name(new_rankic_path)
+        factor_name = resolve_factor_name(raw_name, baseline_summary["factor_name"].astype(str).tolist())
+        new_stats = calc_stats(factor_name, new_daily)
+        before_rank = rank_table(baseline_summary)
+        existed_before = factor_name in set(before_rank["factor_name"].astype(str))
+        old_rank = None
+        if existed_before:
+            old_rank = int(before_rank.loc[before_rank["factor_name"] == factor_name, "rank_ir"].iloc[0])
+
+        row_data = {c: np.nan for c in baseline_summary.columns}
+        row_data.update(
             {
-                "factor_name": factor_name,
-                "old_rank_ir": old_rank,
-                "new_rank_ir": new_rank,
-                "rank_change": (old_rank - new_rank) if old_rank is not None else np.nan,
+                "factor_name": new_stats.factor_name,
                 "mean_rank_ic": new_stats.mean_rank_ic,
                 "rank_ic_std": new_stats.rank_ic_std,
                 "rank_ic_ir": new_stats.rank_ic_ir,
                 "rank_ic_win_rate": new_stats.rank_ic_win_rate,
                 "valid_days": new_stats.valid_days,
             }
-        ]
-    )
-    ranking_change.to_csv(out_dir / "ranking_change_new_factor.csv", index=False, encoding="utf-8-sig")
+        )
+        row = pd.DataFrame([row_data], columns=baseline_summary.columns)
+        merged = baseline_summary[baseline_summary["factor_name"] != factor_name].copy()
+        merged = pd.concat([merged, row], ignore_index=True)
+        after_rank = rank_table(merged)
+        new_rank = int(after_rank.loc[after_rank["factor_name"] == factor_name, "rank_ir"].iloc[0])
 
-    before_simple = before_rank[["factor_name", "rank_ir", "rank_ic_ir"]].rename(
-        columns={"rank_ir": "rank_before", "rank_ic_ir": "rank_ic_ir_before"}
-    )
-    after_simple = after_rank[["factor_name", "rank_ir", "rank_ic_ir"]].rename(
-        columns={"rank_ir": "rank_after", "rank_ic_ir": "rank_ic_ir_after"}
-    )
-    delta = before_simple.merge(after_simple, on="factor_name", how="outer")
-    delta["rank_shift"] = delta["rank_before"] - delta["rank_after"]
-    impacted = delta[delta["rank_shift"].fillna(0) != 0].sort_values("rank_after", na_position="last")
-    impacted.to_csv(out_dir / "ranking_shift_impacted.csv", index=False, encoding="utf-8-sig")
-    after_rank.to_csv(out_dir / "ranking_after_merge.csv", index=False, encoding="utf-8-sig")
+        ranking_change = pd.DataFrame(
+            [
+                {
+                    "factor_name": factor_name,
+                    "old_rank_ir": old_rank,
+                    "new_rank_ir": new_rank,
+                    "rank_change": (old_rank - new_rank) if old_rank is not None else np.nan,
+                    "mean_rank_ic": new_stats.mean_rank_ic,
+                    "rank_ic_std": new_stats.rank_ic_std,
+                    "rank_ic_ir": new_stats.rank_ic_ir,
+                    "rank_ic_win_rate": new_stats.rank_ic_win_rate,
+                    "valid_days": new_stats.valid_days,
+                }
+            ]
+        )
+        ranking_change.to_csv(out_dir / "ranking_change_new_factor.csv", index=False, encoding="utf-8-sig")
 
-    corr, loaded_top = build_correlation_matrix(
-        new_factor_name=factor_name,
-        new_daily=new_daily,
-        baseline_ranked=before_rank,
-        daily_dir=baseline_daily_dir,
-        top_k=max(1, int(args.top_k)),
-    )
-    corr_csv = out_dir / "correlation_top_factors.csv"
-    corr.to_csv(corr_csv, encoding="utf-8-sig")
-    save_heatmap(corr, out_dir / "correlation_top_factors_heatmap.png")
+        before_simple = before_rank[["factor_name", "rank_ir", "rank_ic_ir"]].rename(
+            columns={"rank_ir": "rank_before", "rank_ic_ir": "rank_ic_ir_before"}
+        )
+        after_simple = after_rank[["factor_name", "rank_ir", "rank_ic_ir"]].rename(
+            columns={"rank_ir": "rank_after", "rank_ic_ir": "rank_ic_ir_after"}
+        )
+        delta = before_simple.merge(after_simple, on="factor_name", how="outer")
+        delta["rank_shift"] = delta["rank_before"] - delta["rank_after"]
+        impacted = delta[delta["rank_shift"].fillna(0) != 0].sort_values("rank_after", na_position="last")
+        impacted.to_csv(out_dir / "ranking_shift_impacted.csv", index=False, encoding="utf-8-sig")
+        after_rank.to_csv(out_dir / "ranking_after_merge.csv", index=False, encoding="utf-8-sig")
 
-    seg_df, seg_metrics = segment_stability(new_daily, n_segments=args.segments)
-    seg_df.to_csv(out_dir / "stability_segments.csv", index=False, encoding="utf-8-sig")
-    pd.DataFrame([seg_metrics]).to_csv(out_dir / "stability_metrics.csv", index=False, encoding="utf-8-sig")
+        corr, loaded_top = build_correlation_matrix(
+            new_factor_name=factor_name,
+            new_daily=new_daily,
+            baseline_ranked=before_rank,
+            daily_dir=baseline_daily_dir,
+            top_k=max(1, int(args.top_k)),
+        )
+        corr_csv = out_dir / "correlation_top_factors.csv"
+        corr.to_csv(corr_csv, encoding="utf-8-sig")
+        save_heatmap(corr, out_dir / "correlation_top_factors_heatmap.png")
 
-    recommendation = recommend(new_stats, corr, seg_metrics)
-    recommendation_payload = {
-        "factor_name": factor_name,
-        "new_factor_stats": {
-            "mean_rank_ic": new_stats.mean_rank_ic,
-            "rank_ic_std": new_stats.rank_ic_std,
-            "rank_ic_ir": new_stats.rank_ic_ir,
-            "rank_ic_win_rate": new_stats.rank_ic_win_rate,
-            "valid_days": new_stats.valid_days,
-        },
-        "ranking_change": {
-            "old_rank_ir": old_rank,
-            "new_rank_ir": new_rank,
-            "rank_change": (old_rank - new_rank) if old_rank is not None else None,
-        },
-        "stability_metrics": seg_metrics,
-        "correlation": {
-            "top_loaded_count": len(loaded_top),
-            "top_loaded_factors": loaded_top,
-        },
-        "recommendation": recommendation,
-    }
-    (out_dir / "recommendation.json").write_text(
-        json.dumps(recommendation_payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+        seg_df, seg_metrics = segment_stability(new_daily, n_segments=args.segments)
+        seg_df.to_csv(out_dir / "stability_segments.csv", index=False, encoding="utf-8-sig")
+        pd.DataFrame([seg_metrics]).to_csv(out_dir / "stability_metrics.csv", index=False, encoding="utf-8-sig")
 
-    print("Compare dashboard completed.")
-    print(f"Output dir: {out_dir}")
-    print(f"Factor: {factor_name}")
-    print(f"Rank IC/IR rank: old={old_rank} -> new={new_rank}")
-    print(f"Decision: {recommendation['decision']} (score={recommendation['score']:.1f})")
-    print("Artifacts:")
-    print("  ranking_change_new_factor.csv")
-    print("  ranking_shift_impacted.csv")
-    print("  ranking_after_merge.csv")
-    print("  correlation_top_factors.csv")
-    print("  correlation_top_factors_heatmap.png")
-    print("  stability_segments.csv")
-    print("  stability_metrics.csv")
-    print("  recommendation.json")
-    return 0
+        recommendation = recommend(new_stats, corr, seg_metrics)
+        recommendation_payload = {
+            "factor_name": factor_name,
+            "new_factor_stats": {
+                "mean_rank_ic": new_stats.mean_rank_ic,
+                "rank_ic_std": new_stats.rank_ic_std,
+                "rank_ic_ir": new_stats.rank_ic_ir,
+                "rank_ic_win_rate": new_stats.rank_ic_win_rate,
+                "valid_days": new_stats.valid_days,
+            },
+            "ranking_change": {
+                "old_rank_ir": old_rank,
+                "new_rank_ir": new_rank,
+                "rank_change": (old_rank - new_rank) if old_rank is not None else None,
+            },
+            "stability_metrics": seg_metrics,
+            "correlation": {
+                "top_loaded_count": len(loaded_top),
+                "top_loaded_factors": loaded_top,
+            },
+            "recommendation": recommendation,
+        }
+        (out_dir / "recommendation.json").write_text(
+            json.dumps(recommendation_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        save_meta(
+            "success",
+            extra={
+                "factor_name": factor_name,
+                "metrics": {
+                    "mean_rank_ic": new_stats.mean_rank_ic,
+                    "rank_ic_ir": new_stats.rank_ic_ir,
+                    "rank_ic_win_rate": new_stats.rank_ic_win_rate,
+                    "valid_days": new_stats.valid_days,
+                    "new_rank_ir": int(new_rank),
+                    "old_rank_ir": int(old_rank) if old_rank is not None else None,
+                },
+                "recommendation": recommendation,
+                "artifacts": {
+                    "output_dir": str(out_dir),
+                    "ranking_change_csv": str((out_dir / "ranking_change_new_factor.csv").resolve()),
+                    "correlation_csv": str((out_dir / "correlation_top_factors.csv").resolve()),
+                    "stability_csv": str((out_dir / "stability_segments.csv").resolve()),
+                    "recommendation_json": str((out_dir / "recommendation.json").resolve()),
+                },
+            },
+        )
+
+        print("Compare dashboard completed.")
+        print(f"Output dir: {out_dir}")
+        print(f"Factor: {factor_name}")
+        print(f"Rank IC/IR rank: old={old_rank} -> new={new_rank}")
+        print(f"Decision: {recommendation['decision']} (score={recommendation['score']:.1f})")
+        print("Artifacts:")
+        print("  ranking_change_new_factor.csv")
+        print("  ranking_shift_impacted.csv")
+        print("  ranking_after_merge.csv")
+        print("  correlation_top_factors.csv")
+        print("  correlation_top_factors_heatmap.png")
+        print("  stability_segments.csv")
+        print("  stability_metrics.csv")
+        print("  recommendation.json")
+        return 0
+    except Exception as e:
+        save_meta("failed", error=str(e), extra={"artifacts": {"output_dir": str(out_dir)}})
+        raise
 
 
 if __name__ == "__main__":

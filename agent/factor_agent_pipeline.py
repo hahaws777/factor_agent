@@ -19,10 +19,12 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -31,6 +33,57 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 AGENT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(AGENT_DIR))
+
+
+def _git_commit() -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5, cwd=str(ROOT)
+        )
+        return result.stdout.strip() if result.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def _write_metadata(path: Path, payload: dict) -> Path:
+    def _json_safe(obj):
+        if isinstance(obj, dict):
+            return {k: _json_safe(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_json_safe(v) for v in obj]
+        if isinstance(obj, tuple):
+            return [_json_safe(v) for v in obj]
+        if isinstance(obj, (float, int, str, bool)) or obj is None:
+            if isinstance(obj, float) and (pd.isna(obj) or obj in (float("inf"), float("-inf"))):
+                return None
+            return obj
+        return obj
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(_json_safe(payload), ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def _collect_rankic_metrics(csv_path: Path) -> dict:
+    if not csv_path.is_file():
+        return {}
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception:
+        return {}
+    out = {"rows": int(len(df))}
+    if "rank_ic" in df.columns:
+        s = pd.to_numeric(df["rank_ic"], errors="coerce")
+        out["mean_rank_ic"] = float(s.mean()) if s.notna().any() else None
+        out["std_rank_ic"] = float(s.std()) if s.notna().any() else None
+        std = out["std_rank_ic"]
+        out["rank_ic_ir"] = (out["mean_rank_ic"] / std) if std and std > 0 else None
+        out["rank_ic_win_rate"] = float((s > 0).mean()) if s.notna().any() else None
+    if "ic" in df.columns:
+        s = pd.to_numeric(df["ic"], errors="coerce")
+        out["mean_ic"] = float(s.mean()) if s.notna().any() else None
+    return out
 
 
 def ensure_multiindex(df: pd.DataFrame) -> pd.DataFrame:
@@ -139,6 +192,10 @@ def run_rank_ic_backtest(
 
 
 def main():
+    t0 = time.perf_counter()
+    ts0 = pd.Timestamp.now(tz='UTC')
+    run_id = f"pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
     p = argparse.ArgumentParser(description="Generate factor (via OpenAI) + pickle + rank IC backtest")
     p.add_argument("-d", "--describe", type=str, default="", help="Natural language factor description")
     p.add_argument(
@@ -166,7 +223,50 @@ def main():
     p.add_argument("--workers", type=int, default=None)
     p.add_argument("--backend", type=str, default="pandas", choices=["pandas", "torch"], help="IC backend")
     p.add_argument("--device", type=str, default="auto", help="Torch device when --backend torch")
+    p.add_argument("--metadata-out", type=str, default="", help="Optional metadata json output path")
     args = p.parse_args()
+
+    metadata_target: Path | None = None
+
+    def finalize(status: str, rc: int, error: str = "", extra: dict | None = None):
+        nonlocal metadata_target
+        if metadata_target is None:
+            fallback_dir = ROOT / "agent_runs" / "pipeline_metadata"
+            fallback_dir.mkdir(parents=True, exist_ok=True)
+            metadata_target = fallback_dir / f"{run_id}.json"
+        ts1 = pd.Timestamp.now(tz='UTC')
+        payload = {
+            "run_id": run_id,
+            "status": status,
+            "script": "agent/factor_agent_pipeline.py",
+            "started_at_utc": ts0.isoformat(),
+            "ended_at_utc": ts1.isoformat(),
+            "runtime_sec": float(time.perf_counter() - t0),
+            "return_code": int(rc),
+            "inputs": {
+                "describe": args.describe,
+                "preset": args.preset,
+                "data": str(args.data),
+                "model": args.model,
+                "py_out": args.py_out,
+                "pkl_out": args.pkl_out,
+                "rankic_out": args.rankic_out,
+                "skip_generate": args.skip_generate,
+                "artifact_dir": args.artifact_dir,
+                "no_next_day": bool(args.no_next_day),
+                "no_backtest": bool(args.no_backtest),
+                "no_plot_backtest": bool(args.no_plot_backtest),
+                "workers": args.workers,
+                "backend": args.backend,
+                "device": args.device,
+            },
+            "error": error or None,
+        }
+        if extra:
+            payload.update(extra)
+        meta_path = _write_metadata(metadata_target, payload)
+        print(f"Run metadata saved to: {meta_path}")
+        return rc
 
     skip = args.skip_generate.strip()
     has_d = bool(args.describe.strip())
@@ -193,11 +293,19 @@ def main():
         py_path = Path(skip)
         if not py_path.is_file():
             print(f"Not found: {py_path}", file=sys.stderr)
-            return 1
+            if args.metadata_out:
+                metadata_target = Path(args.metadata_out)
+                if not metadata_target.is_absolute():
+                    metadata_target = (ROOT / metadata_target).resolve()
+            return finalize("failed", 1, error=f"Not found: {py_path}")
     elif args.preset == "volatility_20d":
         if not VOL_TEMPLATE.is_file():
             print(f"Missing template {VOL_TEMPLATE}", file=sys.stderr)
-            return 1
+            if args.metadata_out:
+                metadata_target = Path(args.metadata_out)
+                if not metadata_target.is_absolute():
+                    metadata_target = (ROOT / metadata_target).resolve()
+            return finalize("failed", 1, error=f"Missing template {VOL_TEMPLATE}")
         gen_dir = ROOT / "generated_factors"
         gen_dir.mkdir(parents=True, exist_ok=True)
         py_path = Path(args.py_out) if args.py_out else gen_dir / f"{ts}_volatility_20d.py"
@@ -222,13 +330,34 @@ def main():
         print(f"Saved: {py_path}")
 
     pkl_path = Path(args.pkl_out) if args.pkl_out else py_path.with_suffix(".pkl")
+    if args.metadata_out:
+        metadata_target = Path(args.metadata_out)
+        if not metadata_target.is_absolute():
+            metadata_target = (ROOT / metadata_target).resolve()
+    elif args.artifact_dir.strip():
+        artifact_for_meta = Path(args.artifact_dir)
+        if not artifact_for_meta.is_absolute():
+            artifact_for_meta = (ROOT / artifact_for_meta).resolve()
+        metadata_target = artifact_for_meta / "run_metadata.json"
+    else:
+        metadata_target = pkl_path.parent / "run_metadata.json"
     try:
         run_compute_and_pickle(py_path, pkl_path)
     except Exception as e:
         print(f"compute_factor_df failed: {e}", file=sys.stderr)
         print("Fix the generated .py or rqdatac data access, then:", file=sys.stderr)
         print(f"  python agent/factor_agent_pipeline.py --skip-generate {py_path} --data {args.data}", file=sys.stderr)
-        return 1
+        return finalize(
+            "failed",
+            1,
+            error=f"compute_factor_df failed: {e}",
+            extra={
+                "artifacts": {
+                    "generated_py": str(py_path.resolve()),
+                    "factor_pkl": str(pkl_path.resolve()),
+                }
+            },
+        )
 
     data_pkl = Path(args.data)
     if not data_pkl.is_file():
@@ -238,7 +367,17 @@ def main():
             file=sys.stderr,
         )
         print("Factor pickle is saved; run rank IC manually when data.pkl exists.", file=sys.stderr)
-        return 0
+        return finalize(
+            "success",
+            0,
+            extra={
+                "artifacts": {
+                    "generated_py": str(py_path.resolve()),
+                    "factor_pkl": str(pkl_path.resolve()),
+                },
+                "note": "Factor pickle saved but rankic skipped due to missing market data file.",
+            },
+        )
 
     artifact = Path(args.artifact_dir) if args.artifact_dir.strip() else None
     if artifact is not None:
@@ -268,7 +407,38 @@ def main():
         backend=args.backend,
         device=args.device,
     )
-    return rc
+    metrics = _collect_rankic_metrics(rankic_out)
+
+    # Auto-screen: grade factor quality after IC analysis
+    screening: dict = {}
+    if rankic_out.is_file():
+        try:
+            sys.path.insert(0, str(AGENT_DIR))
+            from factor_screener import screen_ic_csv, format_screening_report  # noqa: E402
+            screening = screen_ic_csv(str(rankic_out), factor_name=pkl_path.stem)
+            print(format_screening_report(screening))
+        except Exception as _e:
+            print(f"[screener] skipped: {_e}")
+
+    status = "success" if rc == 0 else "failed"
+    return finalize(
+        status,
+        rc,
+        error="" if rc == 0 else "rank_ic_backtest subprocess failed",
+        extra={
+            "artifacts": {
+                "generated_py": str(py_path.resolve()),
+                "factor_pkl": str(pkl_path.resolve()),
+                "rankic_csv": str(rankic_out.resolve()),
+                "backtest_output_dir": str(bt_out.resolve()) if bt_out is not None else None,
+                "plot_output_dir": str(plot_out.resolve()) if plot_out is not None else None,
+            },
+            "metrics": metrics,
+            "quality_grade": screening.get("grade"),
+            "quality_score": screening.get("score"),
+            "git_commit": _git_commit(),
+        },
+    )
 
 
 if __name__ == "__main__":

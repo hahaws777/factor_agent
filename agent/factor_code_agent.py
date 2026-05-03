@@ -116,6 +116,16 @@ def extract_python_code(text: str) -> str:
     return text
 
 
+def validate_python_syntax(code: str) -> str | None:
+    """Return error string if code has a syntax error, else None."""
+    import ast
+    try:
+        ast.parse(code)
+        return None
+    except SyntaxError as e:
+        return f"SyntaxError at line {e.lineno}: {e.msg}"
+
+
 def call_openai(user_message: str, model: str) -> str:
     load_env()
     try:
@@ -124,7 +134,7 @@ def call_openai(user_message: str, model: str) -> str:
         print("Install: pip install openai", file=sys.stderr)
         sys.exit(1)
 
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"].strip())
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"].strip(), timeout=120.0)
     resp = client.chat.completions.create(
         model=model,
         messages=[
@@ -184,6 +194,11 @@ def main():
         f"# Model: {args.model}\n"
         f"# User request (summary): {description[:200]!r}\n\n"
     )
+    syntax_err = validate_python_syntax(code)
+    if syntax_err:
+        print(f"WARNING: generated code has a syntax error — {syntax_err}", file=sys.stderr)
+        print("The file will still be saved so you can inspect and fix it manually.", file=sys.stderr)
+
     out_path.write_text(header + code, encoding="utf-8")
     print(f"Saved: {out_path.resolve()}", flush=True)
 

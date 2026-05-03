@@ -8,6 +8,7 @@ Factor composite using PCA + LightGBM.
 - Output: composite factor score, metrics, and saved model.
 """
 
+import logging
 import os
 import sys
 import argparse
@@ -18,6 +19,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.model_selection import train_test_split
 import warnings
+
+log = logging.getLogger(__name__)
 
 warnings.filterwarnings("ignore", category=UserWarning, module="lightgbm")
 
@@ -80,12 +83,14 @@ def load_factors_from_pkl(
             if isinstance(df.index, pd.MultiIndex) or (hasattr(df, "index") and df.index.names and len(df.index.names) >= 2):
                 df = df.reset_index()
             if "order_book_id" not in df.columns or "date" not in df.columns:
+                log.warning("Skipping %s: missing order_book_id or date columns", f.name)
                 continue
             col = [c for c in df.columns if c not in ("order_book_id", "date")][0]
             df = df[["order_book_id", "date", col]].rename(columns={col: f.stem})
             df["date"] = pd.to_datetime(df["date"]).dt.normalize()
             dfs.append(df)
-        except Exception:
+        except Exception as e:
+            log.warning("Skipping %s: %s", f.name, e)
             continue
     if not dfs:
         return None
@@ -264,7 +269,11 @@ def build_factor_matrix_and_target(
             if not factor_cols:
                 raise ValueError("No factor columns in decile files.")
             df = df.sort_values("date").dropna(subset=factor_cols, how="all")
-            # Target: next day's equal-weighted average LS
+            # Target: next-day mean LS across all factors.
+            # Note: this uses shift(-1) on the already-aggregated daily series, so the
+            # look-ahead is exactly one trading day — the same day's factor values are
+            # used to predict the *following* day's returns, which is realistically
+            # achievable (factor computed at close t, trade at open t+1).
             df["return_next"] = df[factor_cols].mean(axis=1).shift(-1)
             df = df.dropna(subset=["return_next"])
             X = df[factor_cols].astype(np.float64).fillna(0)
