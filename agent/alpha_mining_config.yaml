@@ -1,0 +1,57 @@
+# Alpha Mining System — Configuration
+# Edit this file to tune the mining run. All CLI flags override these values.
+
+mining:
+  n_generations: 5          # number of evolution rounds
+  factors_per_generation: 8 # new factors generated each round (LLM + mutations)
+  top_k_survivors: 3        # best factors kept as seeds for the next generation
+  min_grade: "B"            # minimum grade (A/B/C/D/F) for a factor to survive
+  min_rank_ic: 0.015        # hard floor: factors below this are always dropped
+  diversity_penalty: true   # penalise factors too similar to existing survivors
+
+generation:
+  seed_prompts:             # Round-0 starting prompts (overridden by survivors in later rounds)
+    - "20-day price momentum: past 20-day return, cross-sectionally ranked"
+    - "short-term reversal: negative 5-day return, winsorized 1-99%"
+    - "volume-price divergence: 10-day close change divided by 10-day average volume change"
+    - "volatility: 20-day rolling std of daily returns, ranked cross-sectionally"
+  extra_factor_types:       # injected into the LLM prompt to encourage diversity
+    - momentum
+    - reversal
+    - volatility
+    - volume
+    - value_proxy
+    - earnings_quality
+
+mutation:
+  enabled: true
+  window_sweeps: [5, 10, 20, 60]   # replace detected windows with these
+  transforms:                       # transforms to try on top factors
+    - winsorize
+    - rank
+    - zscore
+  max_variants_per_factor: 4        # cap mutations per surviving factor
+  llm_refine: true                  # also ask LLM to intelligently improve survivors
+
+evaluation:
+  data_pkl: "data.pkl"
+  workers: 2              # parallel IC workers per factor (level-2)
+  next_day_return: true
+  exclude_st: true
+  exclude_limit_up: true
+  exclude_limit_down: true
+  exclude_suspended: true
+  timeout_sec: 180        # kill a factor evaluation after this many seconds
+
+llm:
+  model: "gpt-4.1"
+  temperature: 0.4        # slightly higher for more creative factor generation
+  max_retries: 3
+  retry_backoff_sec: 2    # doubles each retry
+
+harness:
+  checkpoint_every: 1     # save checkpoint after every N generations
+  ledger_file: "agent_runs/mining/factor_ledger.csv"   # all-time evaluated factor log
+  dedup_on_code_hash: true   # skip re-evaluating factor code seen before
+  notify_telegram: true      # send Telegram update after each generation (needs TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID env vars)
+  max_run_hours: 4           # safety limit: stop after this many hours

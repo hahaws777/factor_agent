@@ -196,7 +196,7 @@ def batch_analyze_factors(
                 factor_rel = os.path.relpath(factor_file, factor_dir)
                 factor_name = os.path.splitext(os.path.basename(factor_file))[0]
                 try:
-                    rec, log = _run_one_factor(analyzer, factor_file, factor_dir, output_dir, calc_kwargs)
+                    rec, msg = _run_one_factor(analyzer, factor_file, factor_dir, output_dir, calc_kwargs)
                     rec['error'] = None
                     log.info(msg)
                     summary_results.append(rec)
