@@ -45,27 +45,33 @@ CHAT_SYSTEM = (
 DOTENV = ROOT / ".env"
 
 
-def _bootstrap_api_key() -> tuple[bool, str]:
-    if os.environ.get("OPENAI_API_KEY", "").strip():
-        return True, ""
+def _load_dotenv() -> None:
     if not DOTENV.is_file():
-        return False, f"Missing {DOTENV} and OPENAI_API_KEY not set in environment."
+        return
     try:
         from dotenv import load_dotenv
-
         load_dotenv(DOTENV)
+        return
     except ImportError:
-        for line in DOTENV.read_text(encoding="utf-8", errors="ignore").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, _, v = line.partition("=")
-            k, v = k.strip(), v.strip().strip('"').strip("'")
-            if k and k not in os.environ:
-                os.environ[k] = v
-    if not os.environ.get("OPENAI_API_KEY", "").strip():
-        return False, "OPENAI_API_KEY empty after loading .env"
-    return True, ""
+        pass
+    for line in DOTENV.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        k, v = k.strip(), v.strip().strip('"').strip("'")
+        if k and k not in os.environ:
+            os.environ[k] = v
+
+
+def _bootstrap_api_key() -> tuple[bool, str]:
+    """Ensure at least one supported API key (OpenAI or Anthropic) is available."""
+    if os.environ.get("OPENAI_API_KEY", "").strip() or os.environ.get("ANTHROPIC_API_KEY", "").strip():
+        return True, ""
+    _load_dotenv()
+    if os.environ.get("OPENAI_API_KEY", "").strip() or os.environ.get("ANTHROPIC_API_KEY", "").strip():
+        return True, ""
+    return False, "Neither OPENAI_API_KEY nor ANTHROPIC_API_KEY found. Set one in .env or environment."
 
 
 def _inject_theme_css():
@@ -190,20 +196,86 @@ def _render_batch_artifacts(out_dir: Path) -> None:
         st.dataframe(show.head(200), use_container_width=True)
 
 
-def _stream_assistant(messages: list, model: str, temperature: float):
-    from openai import OpenAI
+def _render_mining_run(run_dir: Path) -> None:
+    """Display alpha miner run status and top factors."""
+    import json
+    import pandas as pd
 
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"].strip())
-    stream = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=temperature,
-        stream=True,
-    )
-    for chunk in stream:
-        token = chunk.choices[0].delta.content or ""
-        if token:
-            yield token
+    st.subheader(f"Mining run: {run_dir.name}")
+    cp = run_dir / "checkpoint.json"
+    if not cp.is_file():
+        st.warning("Checkpoint not found.")
+        return
+
+    try:
+        state = json.loads(cp.read_text(encoding="utf-8"))
+    except Exception as e:
+        st.warning(f"Could not read checkpoint: {e}")
+        return
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Generations done", state.get("generations_done", 0))
+    col2.metric("Best grade", state.get("best_grade", "?"))
+    col3.metric("Best mean Rank IC", f"{state.get('best_mean_ric', 0):.4f}")
+    candidates = state.get("all_candidates", [])
+    col4.metric("Total evaluated", len(candidates))
+
+    if candidates:
+        df = pd.DataFrame(candidates)
+        evaluated = df[df.get("error", pd.Series([""] * len(df))).fillna("") == ""] if "error" in df.columns else df
+        show_cols = [c for c in ["name", "generation", "origin", "grade", "mean_rank_ic",
+                                  "rank_ic_ir", "rank_ic_win_rate", "valid_days"] if c in df.columns]
+        if show_cols and "mean_rank_ic" in df.columns:
+            df_show = df[show_cols].copy()
+            df_show["mean_rank_ic"] = pd.to_numeric(df_show["mean_rank_ic"], errors="coerce")
+            df_show = df_show.sort_values("mean_rank_ic", key=abs, ascending=False, na_position="last")
+            st.markdown("**All evaluated factors (sorted by |mean Rank IC|)**")
+            st.dataframe(df_show.head(50), use_container_width=True)
+
+    top_csv = run_dir / "top_factors.csv"
+    if top_csv.is_file():
+        with st.expander("Top survivors (top_factors.csv)"):
+            try:
+                top_df = pd.read_csv(top_csv)
+                st.dataframe(top_df, use_container_width=True)
+            except Exception as e:
+                st.warning(f"Could not read top_factors.csv: {e}")
+
+    report = run_dir / "mining_report.md"
+    if report.is_file():
+        with st.expander("Mining report (markdown)"):
+            st.markdown(report.read_text(encoding="utf-8"))
+
+
+def _stream_assistant(messages: list, model: str, temperature: float, provider: str = "openai"):
+    if provider == "anthropic":
+        from anthropic import Anthropic
+        client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"].strip())
+        system_msg = next((m["content"] for m in messages if m["role"] == "system"), "")
+        user_msgs = [m for m in messages if m["role"] != "system"]
+        with client.messages.stream(
+            model=model,
+            max_tokens=8096,
+            system=system_msg,
+            messages=user_msgs,
+            temperature=temperature,
+        ) as stream:
+            for token in stream.text_stream:
+                if token:
+                    yield token
+    else:
+        from openai import OpenAI
+        client = OpenAI(api_key=os.environ["OPENAI_API_KEY"].strip())
+        stream = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            stream=True,
+        )
+        for chunk in stream:
+            token = chunk.choices[0].delta.content or ""
+            if token:
+                yield token
 
 
 def main():
@@ -226,6 +298,10 @@ def main():
         st.session_state.artifact_default = f"agent_runs/chat_ui_{datetime.now().strftime('%Y%m%d')}"
     if "save_stub" not in st.session_state:
         st.session_state.save_stub = f"chat_{datetime.now().strftime('%Y%m%d_%H%M%S')}.py"
+    if "sb_provider" not in st.session_state:
+        has_anthropic = bool(os.environ.get("ANTHROPIC_API_KEY", "").strip())
+        has_openai = bool(os.environ.get("OPENAI_API_KEY", "").strip())
+        st.session_state.sb_provider = "anthropic" if (has_anthropic and not has_openai) else "openai"
     if "sb_model" not in st.session_state:
         st.session_state.sb_model = "gpt-4.1"
     if "sb_temp" not in st.session_state:
@@ -261,6 +337,7 @@ def main():
                 api_messages,
                 st.session_state.sb_model,
                 float(st.session_state.sb_temp),
+                provider=st.session_state.get("sb_provider", "openai"),
             ):
                 collected.append(token)
                 text_holder.markdown("".join(collected))
@@ -276,12 +353,25 @@ def main():
             last_code = code
             break
 
+    _provider_models = {
+        "openai": ["gpt-4.1", "gpt-4o", "gpt-4o-mini"],
+        "anthropic": ["claude-sonnet-4-6", "claude-opus-4-7", "claude-haiku-4-5-20251001"],
+    }
+
     with st.sidebar:
         st.subheader("Model")
+        provider = st.selectbox(
+            "Provider",
+            ["openai", "anthropic"],
+            key="sb_provider",
+        )
+        model_choices = _provider_models.get(provider, ["gpt-4.1"])
+        # Reset model if it doesn't belong to the selected provider
+        if st.session_state.get("sb_model") not in model_choices:
+            st.session_state.sb_model = model_choices[0]
         st.selectbox(
-            "OpenAI model",
-            ["gpt-4.1", "gpt-4o", "gpt-4o-mini"],
-            label_visibility="collapsed",
+            "Model",
+            model_choices,
             key="sb_model",
         )
         st.slider("Temperature", 0.0, 1.0, 0.2, 0.05, key="sb_temp")
@@ -355,7 +445,8 @@ def main():
                     cmd.extend(["--workers", str(_workers)])
                 _backend = str(st.session_state.get("sb_pipeline_backend", "pandas"))
                 _device = str(st.session_state.get("sb_pipeline_device", "auto")).strip() or "auto"
-                cmd.extend(["--backend", _backend, "--device", _device])
+                _ui_provider = str(st.session_state.get("sb_provider", "openai"))
+                cmd.extend(["--backend", _backend, "--device", _device, "--provider", _ui_provider])
                 with st.spinner("Running pipeline…"):
                     proc = subprocess.run(
                         cmd,
@@ -449,6 +540,24 @@ def main():
             else:
                 st.error(f"Exit code {proc.returncode}")
         st.divider()
+        st.subheader("Alpha Miner runs")
+        mining_dir = ROOT / "agent_runs" / "mining"
+        if mining_dir.is_dir():
+            run_dirs = sorted(
+                [d for d in mining_dir.iterdir() if d.is_dir() and (d / "checkpoint.json").is_file()],
+                key=lambda d: d.stat().st_mtime,
+                reverse=True,
+            )
+            if run_dirs:
+                run_names = [d.name for d in run_dirs[:10]]
+                selected_run = st.selectbox("Select run", run_names, key="sb_mining_run")
+                if st.button("View mining results", use_container_width=True):
+                    st.session_state["mining_run_dir"] = str(mining_dir / selected_run)
+            else:
+                st.caption("No mining runs found.")
+        else:
+            st.caption("No mining runs found.")
+        st.divider()
         if st.button("New conversation", use_container_width=True):
             st.session_state.messages = []
             st.rerun()
@@ -468,6 +577,13 @@ def main():
         if batch_show.is_dir():
             st.divider()
             _render_batch_artifacts(batch_show)
+
+    mining_key = st.session_state.get("mining_run_dir")
+    if mining_key:
+        mining_show = Path(mining_key)
+        if mining_show.is_dir():
+            st.divider()
+            _render_mining_run(mining_show)
 
 
 if __name__ == "__main__":

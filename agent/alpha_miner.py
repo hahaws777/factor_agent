@@ -83,11 +83,13 @@ class MiningConfig:
     llm_refine: bool = True
     # evaluation
     data_pkl: str = "data.pkl"
-    eval_workers: int = 2
+    outer_workers: int = 1      # level-1: how many factors to evaluate in parallel
+    eval_workers: int = 2       # level-2: IC workers per factor evaluation
     next_day_return: bool = True
     timeout_sec: int = 180
     # llm
     model: str = "gpt-4.1"
+    provider: str = "openai"    # "openai" or "anthropic"
     temperature: float = 0.4
     max_retries: int = 3
     retry_backoff_sec: float = 2.0
@@ -134,12 +136,14 @@ class MiningConfig:
 
         ev = raw.get("evaluation", {})
         cfg.data_pkl = ev.get("data_pkl", cfg.data_pkl)
+        cfg.outer_workers = ev.get("outer_workers", cfg.outer_workers)
         cfg.eval_workers = ev.get("workers", cfg.eval_workers)
         cfg.next_day_return = ev.get("next_day_return", cfg.next_day_return)
         cfg.timeout_sec = ev.get("timeout_sec", cfg.timeout_sec)
 
         ll = raw.get("llm", {})
         cfg.model = ll.get("model", cfg.model)
+        cfg.provider = ll.get("provider", cfg.provider)
         cfg.temperature = ll.get("temperature", cfg.temperature)
         cfg.max_retries = ll.get("max_retries", cfg.max_retries)
         cfg.retry_backoff_sec = ll.get("retry_backoff_sec", cfg.retry_backoff_sec)
@@ -242,11 +246,11 @@ def _notify(message: str) -> None:
 
 def _call_llm_with_retry(user_message: str, model: str, cfg: MiningConfig) -> str:
     """Call LLM with exponential-backoff retries."""
-    from factor_code_agent import call_openai
+    from factor_code_agent import call_llm
     last_err = None
     for attempt in range(cfg.max_retries):
         try:
-            return call_openai(user_message, model)
+            return call_llm(user_message, model, provider=cfg.provider)
         except Exception as e:
             last_err = e
             wait = cfg.retry_backoff_sec * (2 ** attempt)
@@ -270,16 +274,6 @@ def _append_ledger(candidate: FactorCandidate, ledger_path: Path) -> None:
 
 # ── LLM prompt builders ───────────────────────────────────────────────────────
 
-_SEED_PROMPTS = [
-    "20-day price momentum: past 20-day cumulative return, cross-sectionally ranked",
-    "short-term reversal: negative 5-day return, winsorized 1-99%",
-    "volume-price divergence: 10-day close change divided by 10-day average volume change",
-    "20-day return volatility: rolling std of daily returns, ranked cross-sectionally",
-]
-
-_FACTOR_TYPES = ["momentum", "reversal", "volatility", "volume", "value_proxy", "earnings_quality"]
-
-
 def _build_generation_prompt(
     description: str,
     survivors: list[FactorCandidate],
@@ -301,13 +295,31 @@ def _build_generation_prompt(
 
     base += (
         "\nYou MUST implement compute_factor_df() -> pd.DataFrame as specified. "
-        "Load ALL inputs from local data.pkl only (Path(__file__).resolve().parents[1] / 'data.pkl'). "
+        "Load ALL inputs from local data.pkl only. Find root by walking up: "
+        "_p=Path(__file__).resolve().parent; "
+        "[_p:=_p.parent for _ in range(6) if not (_p/'data.pkl').is_file()]; root=_p. "
         "Do not use rqdatac or any external data API."
     )
     return base
 
 
 # ── Factor evaluation ─────────────────────────────────────────────────────────
+
+def _patch_data_root(code: str, root: Path) -> str:
+    """Rewrite any `parents[N]`-based root assignment to use the known absolute root.
+
+    Generated code often uses parents[1] which breaks when the .py is saved
+    several levels deep (e.g. agent_runs/mining/<run>/factors/<name>.py).
+    """
+    import re
+    abs_root = str(root.resolve()).replace("\\", "/")
+    patched = re.sub(
+        r'(root\s*=\s*)Path\(__file__\)\.resolve\(\)\.parents\[\d+\]',
+        rf'\1Path(r"{abs_root}")',
+        code,
+    )
+    return patched
+
 
 def _evaluate_candidate(
     candidate: FactorCandidate,
@@ -323,13 +335,15 @@ def _evaluate_candidate(
     py_path.parent.mkdir(parents=True, exist_ok=True)
     ic_csv.parent.mkdir(parents=True, exist_ok=True)
 
-    py_path.write_text(candidate.code, encoding="utf-8")
+    py_path.write_text(_patch_data_root(candidate.code, ROOT), encoding="utf-8")
     candidate.py_path = str(py_path)
     candidate.pkl_path = str(pkl_path)
     candidate.ic_csv_path = str(ic_csv)
 
     # Step 1: compute factor and save pkl
     pipe_script = AGENT_DIR / "factor_agent_pipeline.py"
+    env = os.environ.copy()
+    env["FACTOR_DATA_ROOT"] = str(ROOT.resolve())
     t0 = time.perf_counter()
     try:
         rc = subprocess.call(
@@ -344,6 +358,7 @@ def _evaluate_candidate(
              ],
             cwd=str(ROOT),
             timeout=cfg.timeout_sec,
+            env=env,
         )
     except subprocess.TimeoutExpired:
         candidate.error = f"timeout after {cfg.timeout_sec}s"
@@ -433,11 +448,11 @@ class AlphaMiner:
         from factor_code_agent import extract_python_code, validate_python_syntax
 
         candidates = []
-        factor_types = self.cfg.extra_factor_types or _FACTOR_TYPES
+        factor_types = self.cfg.extra_factor_types
 
         # Use seed prompts for gen-0; diversified prompts for later generations
         if generation == 0:
-            base_prompts = list(self.cfg.seed_prompts) or _SEED_PROMPTS.copy()
+            base_prompts = list(self.cfg.seed_prompts)
         else:
             base_prompts = [
                 f"Generate a novel {ft} factor for A-shares"
@@ -528,17 +543,49 @@ class AlphaMiner:
         return results
 
     def _evaluate_batch(self, candidates: list[FactorCandidate]) -> list[FactorCandidate]:
-        """Evaluate candidates sequentially (subprocess already parallel inside)."""
-        results = []
-        for i, c in enumerate(candidates):
+        """Evaluate candidates with optional outer parallelism (outer_workers)."""
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        n_parallel = max(1, min(len(candidates), self.cfg.outer_workers))
+        results: list[FactorCandidate] = []
+        ledger_lock = threading.Lock()
+        stop_early = threading.Event()
+
+        def _run_one(i: int, c: FactorCandidate) -> FactorCandidate:
+            if stop_early.is_set():
+                c.error = "cancelled: wall-clock limit"
+                return c
             log.info("Evaluating %d/%d: %s", i + 1, len(candidates), c.name)
-            result = _evaluate_candidate(c, self.run_dir, self.cfg)
-            results.append(result)
-            _append_ledger(result, self.ledger_path)
-            # Check wall-clock limit
-            if (time.time() - self.start_wall) / 3600 > self.cfg.max_run_hours:
-                log.warning("Max run hours (%.1f) reached — stopping evaluation early", self.cfg.max_run_hours)
-                break
+            return _evaluate_candidate(c, self.run_dir, self.cfg)
+
+        if n_parallel == 1:
+            for i, c in enumerate(candidates):
+                result = _run_one(i, c)
+                results.append(result)
+                _append_ledger(result, self.ledger_path)
+                if (time.time() - self.start_wall) / 3600 > self.cfg.max_run_hours:
+                    log.warning("Max run hours (%.1f) reached — stopping evaluation early",
+                                self.cfg.max_run_hours)
+                    stop_early.set()
+                    break
+        else:
+            log.info("Parallel evaluation: %d candidates × %d outer workers", len(candidates), n_parallel)
+            with ThreadPoolExecutor(max_workers=n_parallel) as pool:
+                future_map = {pool.submit(_run_one, i, c): c for i, c in enumerate(candidates)}
+                for future in as_completed(future_map):
+                    result = future.result()
+                    results.append(result)
+                    with ledger_lock:
+                        _append_ledger(result, self.ledger_path)
+                    if (time.time() - self.start_wall) / 3600 > self.cfg.max_run_hours:
+                        log.warning("Max run hours (%.1f) reached — cancelling remaining",
+                                    self.cfg.max_run_hours)
+                        stop_early.set()
+                        for f in future_map:
+                            f.cancel()
+                        break
+
         return results
 
     def _select_survivors(
@@ -738,6 +785,9 @@ def main():
     p_start.add_argument("--generations", type=int)
     p_start.add_argument("--per-gen", type=int)
     p_start.add_argument("--model", type=str)
+    p_start.add_argument("--provider", type=str, choices=["openai", "anthropic"],
+                         help="LLM provider (overrides config)")
+    p_start.add_argument("--outer-workers", type=int, help="Parallel factor evaluations (overrides config)")
     p_start.add_argument("--data", type=str)
     p_start.add_argument("--run-id", type=str)
 
@@ -763,6 +813,10 @@ def main():
             cfg.factors_per_generation = args.per_gen
         if args.model:
             cfg.model = args.model
+        if getattr(args, "provider", None):
+            cfg.provider = args.provider
+        if getattr(args, "outer_workers", None):
+            cfg.outer_workers = args.outer_workers
         if args.data:
             cfg.data_pkl = args.data
         miner = AlphaMiner(cfg, run_id=args.run_id)

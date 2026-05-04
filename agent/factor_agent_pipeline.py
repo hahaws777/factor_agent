@@ -223,6 +223,8 @@ def main():
     p.add_argument("--workers", type=int, default=None)
     p.add_argument("--backend", type=str, default="pandas", choices=["pandas", "torch"], help="IC backend")
     p.add_argument("--device", type=str, default="auto", help="Torch device when --backend torch")
+    p.add_argument("--provider", type=str, default="openai", choices=["openai", "anthropic"],
+                   help="LLM provider for factor generation: openai (default) or anthropic")
     p.add_argument("--metadata-out", type=str, default="", help="Optional metadata json output path")
     args = p.parse_args()
 
@@ -283,7 +285,7 @@ def main():
 
     from factor_code_agent import (  # noqa: E402
         default_user_prefix,
-        call_openai,
+        call_llm,
         extract_python_code,
     )
 
@@ -315,8 +317,8 @@ def main():
         py_path.write_text(hdr + py_path.read_text(encoding="utf-8"), encoding="utf-8")
         print(f"Preset copied to: {py_path}")
     else:
-        print("Calling OpenAI to generate factor code...", flush=True)
-        raw = call_openai(default_user_prefix(args.describe), args.model)
+        print(f"Calling {args.provider.upper()} ({args.model}) to generate factor code...", flush=True)
+        raw = call_llm(default_user_prefix(args.describe), args.model, provider=args.provider)
         code = extract_python_code(raw)
         gen_dir = ROOT / "generated_factors"
         gen_dir.mkdir(parents=True, exist_ok=True)

@@ -35,7 +35,8 @@ mutation:
 
 evaluation:
   data_pkl: "data.pkl"
-  workers: 2              # parallel IC workers per factor (level-2)
+  outer_workers: 1        # level-1: how many factors to evaluate in parallel (1 = sequential)
+  workers: 2              # level-2: parallel IC workers per factor evaluation
   next_day_return: true
   exclude_st: true
   exclude_limit_up: true
@@ -44,10 +45,11 @@ evaluation:
   timeout_sec: 180        # kill a factor evaluation after this many seconds
 
 llm:
-  model: "gpt-4.1"
-  temperature: 0.4        # slightly higher for more creative factor generation
+  model: "gpt-4.1"                # for anthropic: e.g. claude-sonnet-4-6 or claude-opus-4-7
+  provider: "openai"              # "openai" (needs OPENAI_API_KEY) or "anthropic" (needs ANTHROPIC_API_KEY)
+  temperature: 0.4                # slightly higher for more creative factor generation
   max_retries: 3
-  retry_backoff_sec: 2    # doubles each retry
+  retry_backoff_sec: 2            # doubles each retry
 
 harness:
   checkpoint_every: 1     # save checkpoint after every N generations

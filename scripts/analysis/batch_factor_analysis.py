@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-批量分析多个因子的Rank IC
+Batch Rank IC analysis for multiple factor files.
 """
 
 import logging
@@ -139,12 +139,14 @@ def batch_analyze_factors(
     **kwargs,
 ):
     """
-    批量分析因子
-    
-    参数:
-        factor_dir: 因子目录路径
-        output_dir: 输出目录
-        **kwargs: 传递给calculate_rank_ic的其他参数
+    Batch-analyze all factor .pkl files in factor_dir and write per-factor Rank IC CSVs.
+
+    Parameters
+    ----------
+    factor_dir    : directory containing factor .pkl files (searched recursively)
+    output_dir    : directory for output Rank IC CSVs and summary
+    factor_workers: number of factors to analyze in parallel (level-1)
+    **kwargs      : passed through to calculate_rank_ic
     """
     
     t0 = time.perf_counter()
@@ -157,7 +159,6 @@ def batch_analyze_factors(
         metadata_out = os.path.abspath(metadata_out)
 
     try:
-        # 创建输出目录
         os.makedirs(output_dir, exist_ok=True)
         
         factor_files = sorted(glob.glob(os.path.join(factor_dir, '**', '*.pkl'), recursive=True))
@@ -183,7 +184,6 @@ def batch_analyze_factors(
             log.warning("factor_workers>1 and workers>1 detected; "
                         "two-level parallelism may oversubscribe CPU.")
         
-        # 汇总结果
         summary_results = []
 
         if factor_workers == 1:
@@ -226,7 +226,6 @@ def batch_analyze_factors(
                     log.info(msg)
                     summary_results.append(rec)
         
-        # 保存汇总结果
         summary_df = pd.DataFrame(summary_results)
         summary_file = os.path.join(output_dir, 'summary.csv')
         summary_df.to_csv(summary_file, index=False, encoding='utf-8-sig')

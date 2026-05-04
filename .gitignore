@@ -8,8 +8,15 @@ __pycache__/
 *.py[cod]
 .Python
 .venv/
+.venv*/
 venv/
+venv*/
+venv321/
 env/
+env*/
+ENV/
+conda-env/
+.conda/
 
 # IDE / OS
 .vscode/

@@ -10,8 +10,15 @@ __pycache__/
 .Python
 *.so
 .venv/
+.venv*/
 venv/
+venv*/
+venv321/
 env/
+env*/
+ENV/
+conda-env/
+.conda/
 *.egg-info/
 .eggs/
 dist/

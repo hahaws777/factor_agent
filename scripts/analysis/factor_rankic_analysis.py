@@ -271,33 +271,42 @@ class FactorRankICAnalyzer:
                  exclude_suspended, use_next_day_return, backend,
                  f" device={device}" if backend == 'torch' else "")
         
-        # 复制数据
         data = self.merged_data.copy()
-        
-        # 计算收益率
+
+        data = data.sort_values(['order_book_id', 'date'])
         if use_next_day_return:
-            # 使用下一日收益率（前瞻性，实际交易中可实现）
-            data = data.sort_values(['order_book_id', 'date'])
             data['return'] = data.groupby('order_book_id')['close'].pct_change(1, fill_method=None).shift(-1)
+            # Pre-compute next-day limit flags before any row drops
+            if exclude_limit_up or exclude_limit_down:
+                data['_next_luf'] = data.groupby('order_book_id')['limit_up_flag'].shift(-1)
+                data['_next_ldf'] = data.groupby('order_book_id')['limit_down_flag'].shift(-1)
         else:
-            # 使用同期收益率（用于分析因子解释能力）
-            data = data.sort_values(['order_book_id', 'date'])
             data['return'] = data.groupby('order_book_id')['close'].pct_change(1, fill_method=None)
-        
-        # 应用过滤条件
+
+        # Filter: ST and suspended are proper bool columns — astype(bool) is safe.
+        # limit_up_flag / limit_down_flag are object dtype with possible NaN values;
+        # NaN.astype(bool) == True, which would wrongly exclude non-limit rows.
+        # Use == True to treat NaN as "not limit-up".
         if exclude_st:
             data = data[~data['ST'].astype(bool)]
-        
+
         if exclude_limit_up:
-            data = data[~data['limit_up_flag'].astype(bool)]
-        
+            data = data[data['limit_up_flag'] != True]          # signal-day limit-up
+
         if exclude_limit_down:
-            data = data[~data['limit_down_flag'].astype(bool)]
-        
+            data = data[data['limit_down_flag'] != True]        # signal-day limit-down
+
         if exclude_suspended:
             data = data[~data['suspended'].astype(bool)]
-        
-        # 去除无效数据
+
+        # Also exclude rows where the return is measured on a limit-up/down day:
+        # that return is capped and not a clean alpha signal.
+        if use_next_day_return:
+            if exclude_limit_up and '_next_luf' in data.columns:
+                data = data[data['_next_luf'] != True]
+            if exclude_limit_down and '_next_ldf' in data.columns:
+                data = data[data['_next_ldf'] != True]
+
         data = data.dropna(subset=[self.factor_name, 'return'])
         
         log.info("Valid records after filtering: %d", len(data))
@@ -460,24 +469,30 @@ class FactorRankICAnalyzer:
 
         data = self.merged_data.copy()
 
-        # 收益率序列（回测通常使用下一日收益）
         data = data.sort_values(['order_book_id', 'date'])
         if use_next_day_return:
             data['return'] = data.groupby('order_book_id')['close'].pct_change(1, fill_method=None).shift(-1)
+            if exclude_limit_up or exclude_limit_down:
+                data['_next_luf'] = data.groupby('order_book_id')['limit_up_flag'].shift(-1)
+                data['_next_ldf'] = data.groupby('order_book_id')['limit_down_flag'].shift(-1)
         else:
             data['return'] = data.groupby('order_book_id')['close'].pct_change(1, fill_method=None)
 
-        # 过滤
         if exclude_st:
             data = data[~data['ST'].astype(bool)]
         if exclude_limit_up:
-            data = data[~data['limit_up_flag'].astype(bool)]
+            data = data[data['limit_up_flag'] != True]
         if exclude_limit_down:
-            data = data[~data['limit_down_flag'].astype(bool)]
+            data = data[data['limit_down_flag'] != True]
         if exclude_suspended:
             data = data[~data['suspended'].astype(bool)]
 
-        # 有效样本
+        if use_next_day_return:
+            if exclude_limit_up and '_next_luf' in data.columns:
+                data = data[data['_next_luf'] != True]
+            if exclude_limit_down and '_next_ldf' in data.columns:
+                data = data[data['_next_ldf'] != True]
+
         data = data.dropna(subset=[self.factor_name, 'return'])
         if data.empty:
             raise ValueError("No valid data for backtest after filtering.")
