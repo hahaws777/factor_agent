@@ -197,6 +197,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             "-d", args.describe,
             "--data", args.data,
             "--artifact-dir", str(artifact_dir),
+            "--provider", args.provider,
             "--model", args.model,
             "--no-backtest",
         ]
@@ -322,8 +323,11 @@ def cmd_screen_dir(args: argparse.Namespace) -> int:
         "--output-dir", str(out_dir),
         "--data", args.data,
         "--factor-workers", str(args.factor_workers),
+        "--backend", args.backend,
         "--metadata-out", str(out_dir / "run_metadata.json"),
     ]
+    if args.ic_workers is not None:
+        cmd += ["--ic-workers", str(args.ic_workers)]
     if args.skip_existing:
         cmd.append("--skip-existing")
     rc = subprocess.call(cmd, cwd=str(ROOT))
@@ -483,7 +487,8 @@ def main():
     p_run.add_argument("-d", "--describe", default="", help="Natural language factor description (triggers LLM generation)")
     p_run.add_argument("--factor-pkl", default="", help="Use existing factor .pkl instead of generating")
     p_run.add_argument("--data", default="data.pkl")
-    p_run.add_argument("--model", default="gpt-4.1", help="OpenAI model for generation")
+    p_run.add_argument("--provider", default="openai", choices=["openai", "anthropic"], help="LLM provider")
+    p_run.add_argument("--model", default="gpt-4.1", help="LLM model for generation")
     p_run.add_argument("--artifact-dir", default="", help="Output directory (auto-named if empty)")
     p_run.add_argument("--horizons", nargs="+", type=int, default=[1, 5, 10, 20])
     p_run.add_argument("--neutralize", default="", help="Comma-separated neutralization methods: cross_demean,mktcap,industry")
@@ -494,6 +499,8 @@ def main():
     p_sd.add_argument("--data", default="data.pkl")
     p_sd.add_argument("--output-dir", default="")
     p_sd.add_argument("--factor-workers", type=int, default=1)
+    p_sd.add_argument("--ic-workers", type=int, default=None, help="Per-factor IC worker threads (level-2)")
+    p_sd.add_argument("--backend", default="pandas", choices=["pandas", "torch"])
     p_sd.add_argument("--skip-existing", action="store_true")
 
     # ── decay ────────────────────────────────────────────────────────────────

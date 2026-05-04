@@ -1,81 +1,71 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-批量打包所有因子目录下的文件，支持并行处理
+Pack all factor directories into zip archives with parallel processing.
+Each subdirectory is split into num_parts zip files.
 """
+import math
 import os
 import zipfile
-from pathlib import Path
-from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import math
+from pathlib import Path
+
+from tqdm import tqdm
+
 
 def pack_directory_files(source_dir, output_dir, num_parts=8, max_workers=4):
     """
-    打包一个目录下的所有文件，分成指定数量的zip文件
-    
-    Args:
-        source_dir: 源目录路径
-        output_dir: 输出目录路径
-        num_parts: 分成多少个zip文件
-        max_workers: 并行处理的最大线程数
+    Pack all .npz files in source_dir into num_parts zip files.
+
+    Parameters
+    ----------
+    source_dir  : source directory path
+    output_dir  : output directory path
+    num_parts   : number of zip files to create
+    max_workers : thread pool size
     """
     source_path = Path(source_dir)
     output_path = Path(output_dir)
     output_path.mkdir(exist_ok=True, parents=True)
-    
-    # 获取所有npz文件并排序
-    files = sorted([f for f in source_path.glob("*.npz")])
+
+    files = sorted(source_path.glob("*.npz"))
     total_files = len(files)
-    
+
     if total_files == 0:
-        print(f"{source_dir}: 没有找到文件")
+        print(f"{source_dir}: no files found")
         return 0, 0
-    
+
     dir_name = source_path.name
-    
-    # 计算每个zip文件应该包含多少个文件
     files_per_part = math.ceil(total_files / num_parts)
-    
-    print(f"\n{dir_name}: 找到 {total_files} 个文件，将分成 {num_parts} 个zip文件（每个约 {files_per_part} 个文件）")
-    
+    print(f"\n{dir_name}: {total_files} files → {num_parts} zips (~{files_per_part} each)")
+
     def create_zip(group_idx, group_files, zip_filename):
-        """创建单个zip文件"""
         try:
             with zipfile.ZipFile(zip_filename, 'w', zipfile.ZIP_DEFLATED) as zipf:
                 for file_path in group_files:
-                    arcname = file_path.name
-                    zipf.write(file_path, arcname)
-            
-            zip_size = zip_filename.stat().st_size / (1024 * 1024)  # MB
+                    zipf.write(file_path, file_path.name)
+            zip_size = zip_filename.stat().st_size / (1024 * 1024)
             return group_idx, zip_filename, zip_size, True, None
         except Exception as e:
             return group_idx, zip_filename, 0, False, str(e)
-    
-    # 准备所有任务
+
     tasks = []
     for part_idx in range(num_parts):
         start_idx = part_idx * files_per_part
         end_idx = min(start_idx + files_per_part, total_files)
-        
         if start_idx >= total_files:
             break
-        
         group_files = files[start_idx:end_idx]
         zip_filename = output_path / f"{dir_name}_part{part_idx + 1:02d}.zip"
         tasks.append((part_idx + 1, group_files, zip_filename))
-    
-    # 并行处理
+
     results = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # 提交所有任务
         future_to_task = {
-            executor.submit(create_zip, idx, files, zip_path): (idx, zip_path.name)
-            for idx, files, zip_path in tasks
+            executor.submit(create_zip, idx, f, zip_path): (idx, zip_path.name)
+            for idx, f, zip_path in tasks
         }
-        
-        # 使用tqdm显示进度
-        with tqdm(total=len(tasks), desc=f"{dir_name}") as pbar:
+        with tqdm(total=len(tasks), desc=dir_name) as pbar:
             for future in as_completed(future_to_task):
                 idx, zip_name = future_to_task[future]
                 try:
@@ -85,60 +75,49 @@ def pack_directory_files(source_dir, output_dir, num_parts=8, max_workers=4):
                     if success:
                         pbar.set_postfix_str(f"Part {group_idx}: {zip_size:.1f}MB")
                     else:
-                        print(f"错误: {zip_name} - {error}")
+                        print(f"Error: {zip_name} - {error}")
                 except Exception as e:
-                    print(f"错误: {zip_name} - {str(e)}")
+                    print(f"Error: {zip_name} - {e}")
                 finally:
                     pbar.update(1)
-    
-    # 显示结果
+
     successful = [r for r in results if r[3]]
     total_size = sum(r[2] for r in successful)
-    print(f"{dir_name}: 完成 {len(successful)}/{len(tasks)} 个zip文件，总大小 {total_size:.2f} MB")
-    
+    print(f"{dir_name}: {len(successful)}/{len(tasks)} zips done, {total_size:.2f} MB total")
     return len(successful), total_size
+
 
 def pack_all_factors(base_dir="factors_by_type", output_base="factors_zips", num_parts=8, max_workers=4):
     """
-    打包所有因子目录，每个目录分成指定数量的zip文件
-    
-    Args:
-        base_dir: 基础目录
-        output_base: 输出基础目录
-        num_parts: 每个目录分成多少个zip文件
-        max_workers: 并行处理的最大线程数
+    Pack every subdirectory under base_dir into zip archives.
+
+    Parameters
+    ----------
+    base_dir    : root directory of factor subdirectories
+    output_base : output root directory
+    num_parts   : zip files per subdirectory
+    max_workers : thread pool size per subdirectory
     """
     base_path = Path(base_dir)
-    
-    # 获取所有子目录
     subdirs = [d for d in base_path.iterdir() if d.is_dir()]
-    
-    print(f"找到 {len(subdirs)} 个目录需要打包")
-    print(f"每个目录将分成 {num_parts} 个zip文件")
-    
+    print(f"Found {len(subdirs)} directories to pack ({num_parts} zips each)")
+
     total_zips = 0
     total_size = 0
-    
-    # 逐个目录处理（目录之间串行，但每个目录内的zip文件并行）
     for subdir in subdirs:
         output_dir = Path(output_base) / subdir.name
         zips, size = pack_directory_files(subdir, output_dir, num_parts, max_workers)
         total_zips += zips
         total_size += size
-    
-    print(f"\n所有目录打包完成！")
-    print(f"总共生成 {total_zips} 个zip文件")
-    print(f"总大小: {total_size / 1024:.2f} GB")
+
+    print(f"\nAll done — {total_zips} zip files, {total_size / 1024:.2f} GB total")
+
 
 if __name__ == "__main__":
-    import os
-    from pathlib import Path
     os.chdir(Path(__file__).resolve().parents[2])
-    # 每个目录分成8个zip文件；因子目录在 factors_by_type_npy/factors_by_type
     pack_all_factors(
         base_dir=str(Path("factors_by_type_npy/factors_by_type")),
         output_base="factors_zips",
         num_parts=8,
         max_workers=4,
     )
-

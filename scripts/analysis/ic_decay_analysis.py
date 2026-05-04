@@ -115,15 +115,19 @@ class ICDecayAnalyzer:
         log.info("Computing IC decay for horizons %s", horizons)
 
         data = self._merge().copy()
-        # Apply market filters using available columns
+        # Apply market filters using available columns.
+        # Use != True (not astype(bool)) — limit_up/down flags are object dtype with NaN,
+        # and NaN.astype(bool) == True which would silently drop ~37% of rows.
         for flag, col in [
             (exclude_st, "ST"),
-            (exclude_limit_up, "limit_up_flag"),
-            (exclude_limit_down, "limit_down_flag"),
             (exclude_suspended, "suspended"),
         ]:
             if flag and col in data.columns:
                 data = data[~data[col].astype(bool)]
+        if exclude_limit_up and "limit_up_flag" in data.columns:
+            data = data[data["limit_up_flag"] != True]
+        if exclude_limit_down and "limit_down_flag" in data.columns:
+            data = data[data["limit_down_flag"] != True]
 
         data = data.sort_values(["order_book_id", "date"])
 

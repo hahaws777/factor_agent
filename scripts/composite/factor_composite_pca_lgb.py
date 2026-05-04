@@ -237,10 +237,10 @@ def build_factor_matrix_and_target(
 ) -> tuple:
     """
     Build (X: factor matrix, y: forward return, meta) from CSV, pkl, npz, or decile.
-    - factors_npz_dir: factors_by_type_npy/factors_by_type -> 个股因子 npz，需配合 market 算个股收益。
-    - decile_dir: 组合日频 LS，无个股。
+    - factors_npz_dir: factors_by_type_npy/factors_by_type -> per-stock factor npz, requires market data for returns.
+    - decile_dir: portfolio-level daily LS returns, no per-stock data.
     """
-    # Source: 个股因子 npz (factors_by_type_npy/factors_by_type)
+    # Source: per-stock factor npz (factors_by_type_npy/factors_by_type)
     if factors_npz_dir and Path(factors_npz_dir).exists():
         fdf = load_factors_from_npz(factors_npz_dir, max_factors=max_factors)
         if fdf is not None and len(fdf) > 0:

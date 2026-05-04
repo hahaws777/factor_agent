@@ -307,11 +307,11 @@ def recommend(
 
     score = float(max(0.0, min(100.0, score)))
     if score >= 70:
-        decision = "入池"
+        decision = "in_pool"
     elif score >= 50:
-        decision = "观察"
+        decision = "watchlist"
     else:
-        decision = "淘汰"
+        decision = "eliminate"
 
     return {
         "decision": decision,

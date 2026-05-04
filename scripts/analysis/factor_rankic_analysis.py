@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-因子Rank IC分析工具
-支持过滤ST股票、涨跌停股票
+Factor Rank IC analysis tool.
+Supports filtering ST stocks, limit-up/down stocks, and suspended stocks.
 """
 
 import logging
@@ -137,14 +137,13 @@ def _torch_calc_rows_by_segments(
     return rows
 
 class FactorRankICAnalyzer:
-    """因子Rank IC分析器"""
-    
+    """Factor Rank IC analyzer."""
+
     def __init__(self, data_pkl='data.pkl'):
         """
-        初始化分析器
-        
-        参数:
-            data_pkl: 行情数据文件路径
+        Parameters
+        ----------
+        data_pkl : path to market data pickle file
         """
         self.data_pkl = data_pkl
         self.market_data = None
@@ -180,7 +179,7 @@ class FactorRankICAnalyzer:
         return self
         
     def load_market_data(self):
-        """加载行情数据"""
+        """Load market data from pickle."""
         if self.market_data is not None and self.market_data_indexed is not None:
             log.info("Market data already loaded in memory; skip reloading.")
             return self
@@ -200,7 +199,7 @@ class FactorRankICAnalyzer:
         return self
     
     def load_factor(self, factor_file):
-        """加载因子数据"""
+        """Load factor from a .pkl file."""
         log.info("Loading factor from %s...", factor_file)
         if not os.path.isfile(factor_file):
             raise FileNotFoundError(f"Factor file not found: {factor_file}")
@@ -215,7 +214,7 @@ class FactorRankICAnalyzer:
         return self
     
     def merge_data(self):
-        """合并行情数据和因子数据"""
+        """Merge market data with factor data."""
         log.info("Merging market and factor data...")
 
         if self.market_data is None:
@@ -253,17 +252,19 @@ class FactorRankICAnalyzer:
                          backend='pandas',
                          device='auto'):
         """
-        计算Rank IC
-        
-        参数:
-            exclude_st: 是否排除ST股票
-            exclude_limit_up: 是否排除涨停股票
-            exclude_limit_down: 是否排除跌停股票
-            exclude_suspended: 是否排除停牌股票
-            use_next_day_return: 是否使用下一日收益率（前瞻性）
-        
-        返回:
-            IC分析结果DataFrame
+        Compute Rank IC (and Pearson IC) for the merged factor / return data.
+
+        Parameters
+        ----------
+        exclude_st            : drop ST-flagged stocks from the signal day
+        exclude_limit_up      : drop limit-up stocks from the signal day (and return day when next_day=True)
+        exclude_limit_down    : drop limit-down stocks from the signal day (and return day when next_day=True)
+        exclude_suspended     : drop suspended stocks
+        use_next_day_return   : use T+1 return instead of same-day return
+
+        Returns
+        -------
+        pd.DataFrame with per-day IC, rank_ic, p_value, n_stocks
         """
         log.info("Calculating Rank IC | exclude_st=%s limit_up=%s limit_down=%s "
                  "suspended=%s next_day=%s backend=%s%s",
@@ -319,7 +320,7 @@ class FactorRankICAnalyzer:
             log.info("Using torch backend on device: %s", resolved_device)
             rows = _torch_calc_rows_by_segments(data, self.factor_name, resolved_device)
         else:
-            # 预分组，避免在子进程里重复过滤
+            # Pre-group by date so workers don't repeat the filter step
             grouped = list((d, g[[self.factor_name, 'return']].copy()) for d, g in data.groupby('date', sort=True))
             tasks = [(d, g, self.factor_name) for d, g in grouped]
             if workers is None or workers <= 1:
@@ -364,7 +365,6 @@ class FactorRankICAnalyzer:
         result['ic'] = result['ic'].fillna(0)
         result['rank_ic'] = result['rank_ic'].fillna(0)
 
-        # 保存到对象
         result['date'] = pd.to_datetime(result['date'])
         self.ic_results = result[['date', 'ic', 'rank_ic', 'p_value', 'ic_p_value', 'n_stocks']].sort_values('date')
         
@@ -373,7 +373,7 @@ class FactorRankICAnalyzer:
         return self
     
     def print_statistics(self):
-        """打印IC统计信息"""
+        """Print IC / Rank IC summary statistics."""
         if self.ic_results is None or len(self.ic_results) == 0:
             print("No IC results to display")
             return
@@ -384,7 +384,7 @@ class FactorRankICAnalyzer:
         print(f"Factor Name: {self.factor_name}")
         print(f"Total Valid Days: {len(self.ic_results)}")
         
-        # IC统计
+        # IC stats
         ic_series = self.ic_results['ic']
         print(f"\nIC Statistics:")
         print(f"  Mean IC:       {ic_series.mean():.6f}")
@@ -395,12 +395,12 @@ class FactorRankICAnalyzer:
         if ic_series.std() > 0:
             print(f"  IC IR:         {ic_series.mean() / ic_series.std():.6f}")
         
-        # IC胜率
+        # IC win rate
         print(f"  IC Win Rate:   {(ic_series > 0).mean()*100:.2f}%")
         print(f"  IC > 0.05:     {(ic_series > 0.05).mean()*100:.2f}%")
         print(f"  IC < -0.05:    {(ic_series < -0.05).mean()*100:.2f}%")
         
-        # Rank IC统计
+        # Rank IC stats
         rank_ic_series = self.ic_results['rank_ic']
         print(f"\nRank IC Statistics:")
         print(f"  Mean Rank IC:  {rank_ic_series.mean():.6f}")
@@ -411,12 +411,12 @@ class FactorRankICAnalyzer:
         if rank_ic_series.std() > 0:
             print(f"  Rank IC IR:    {rank_ic_series.mean() / rank_ic_series.std():.6f}")
         
-        # Rank IC胜率
+        # Rank IC win rate
         print(f"  Rank IC Win Rate:  {(rank_ic_series > 0).mean()*100:.2f}%")
         print(f"  Rank IC > 0.05:    {(rank_ic_series > 0.05).mean()*100:.2f}%")
         print(f"  Rank IC < -0.05:   {(rank_ic_series < -0.05).mean()*100:.2f}%")
         
-        # 平均股票数
+        # Average stock count
         print(f"\nAverage stocks per day: {self.ic_results['n_stocks'].mean():.0f}")
         
         print("="*80)
@@ -425,17 +425,18 @@ class FactorRankICAnalyzer:
     
     def save_results(self, output_file=None):
         """
-        保存IC分析结果
-        
-        参数:
-            output_file: 输出文件路径
+        Save IC analysis results to CSV.
+
+        Parameters
+        ----------
+        output_file : output path (auto-named if None)
         """
         if self.ic_results is None or len(self.ic_results) == 0:
             print("No results to save")
             return self
 
         if output_file is None:
-            # 生成默认文件名
+            # Auto-generate filename
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             output_file = f'rankic_results_{self.factor_name}_{timestamp}.csv'
         
@@ -453,16 +454,18 @@ class FactorRankICAnalyzer:
                          use_next_day_return=True,
                          workers=None):
         """
-        因子分位回测（默认10分位），计算等权分组日收益与多空收益（Q10 - Q1）。
+        Factor decile backtest (default 10 bins). Computes equal-weight group
+        daily returns and long-short return (top_bin - bottom_bin).
 
-        参数:
-            n_bins: 分组数量（默认10）
-            exclude_st/limit_up/limit_down/suspended: 过滤选项
-            use_next_day_return: 是否使用下一日收益进行回测（交易实现）
+        Parameters
+        ----------
+        n_bins              : number of quantile buckets (default 10)
+        exclude_st / limit_up / limit_down / suspended : filter flags
+        use_next_day_return : use T+1 return for realistic trade execution
 
-        结果:
-            self.backtest_daily_returns: DataFrame[date, Q1..Qn, LS]
-            self.backtest_cum_returns: DataFrame[date, Q1..Qn, LS]
+        Results are stored in:
+            self.backtest_daily_returns : DataFrame[date, Q1..Qn, LS]
+            self.backtest_cum_returns   : DataFrame[date, Q1..Qn, LS]
         """
         if self.merged_data is None:
             raise ValueError("Please call merge_data() before backtesting.")
@@ -497,7 +500,7 @@ class FactorRankICAnalyzer:
         if data.empty:
             raise ValueError("No valid data for backtest after filtering.")
 
-        # 按日期内分位
+        # Quantile-bin within each date
         grouped = list((d, g[['order_book_id', self.factor_name, 'return']].copy()) for d, g in data.groupby('date', sort=True))
         tasks = [(d, g, self.factor_name, n_bins) for d, g in grouped]
 
@@ -508,7 +511,7 @@ class FactorRankICAnalyzer:
             with ProcessPoolExecutor(max_workers=max_workers) as ex:
                 rows = list(ex.map(_parallel_decile_calc, tasks, chunksize=1))
 
-        # 组装为DataFrame
+        # Build DataFrame from per-day results
         records = []
         for d, means in rows:
             if means is None or len(means) == 0:
@@ -522,13 +525,13 @@ class FactorRankICAnalyzer:
 
         ret_tbl = pd.DataFrame(records).set_index('date').sort_index()
 
-        # 统一列名 Q1..Qn（Q1为最低分位，Qn为最高分位）
+        # Rename bins to Q1..Qn (Q1 = bottom quantile, Qn = top quantile)
         col_map = {}
         for i, c in enumerate(ret_tbl.columns):
             col_map[c] = f"Q{i+1}"
         ret_tbl = ret_tbl.rename(columns=col_map)
 
-        # 多空：最高分位 - 最低分位
+        # Long-short: top quantile minus bottom quantile
         q_low = f"Q1"
         q_high = f"Q{min(n_bins, len(ret_tbl.columns))}"
         if q_low in ret_tbl.columns and q_high in ret_tbl.columns:
@@ -536,10 +539,9 @@ class FactorRankICAnalyzer:
         else:
             ret_tbl['LS'] = np.nan
 
-        # 累计曲线（简单复利累计）
+        # Cumulative compound return
         cum_tbl = (1.0 + ret_tbl.fillna(0)).cumprod() - 1.0
 
-        # 保存到对象
         ret_tbl = ret_tbl.reset_index()
         cum_tbl = cum_tbl.reset_index()
         ret_tbl['date'] = pd.to_datetime(ret_tbl['date'])
@@ -555,11 +557,12 @@ class FactorRankICAnalyzer:
 
     def save_backtest(self, output_dir=None, prefix=None):
         """
-        保存分位回测的日收益与累计曲线
+        Save decile daily returns and cumulative return curves to CSV.
 
-        参数:
-            output_dir: 输出目录，默认在当前目录下 backtest_results
-            prefix: 文件名前缀，默认使用因子名
+        Parameters
+        ----------
+        output_dir : output directory (default: backtest_results/)
+        prefix     : filename prefix (default: factor name)
         """
         if self.backtest_daily_returns is None or self.backtest_cum_returns is None:
             print("No backtest results to save")
@@ -585,12 +588,13 @@ class FactorRankICAnalyzer:
 
     def plot_backtest_cumulative(self, from_file=None, output_dir=None, prefix=None):
         """
-        绘制累计收益曲线图（Q1..Qn 与 LS），英文标签。
+        Plot cumulative return curves for Q1..Qn and the LS spread.
 
-        参数:
-            from_file: 可选，直接从CSV读取累计收益（如 *_decile_cum_returns.csv）
-            output_dir: 输出目录（默认 backtest_plots）
-            prefix: 文件名前缀（默认因子名）
+        Parameters
+        ----------
+        from_file  : optional CSV path to read cumulative returns from directly
+        output_dir : output directory (default: backtest_plots/)
+        prefix     : filename prefix (default: factor name)
         """
         if from_file is not None:
             cum_df = pd.read_csv(from_file)
@@ -611,13 +615,13 @@ class FactorRankICAnalyzer:
         if prefix is None:
             prefix = getattr(self, 'factor_name', 'factor')
 
-        # 识别分组列与LS
+        # Identify quantile columns and LS
         cols = [c for c in cum_df.columns if c != 'date']
         ls_col = 'LS' if 'LS' in cols else None
         quant_cols = [c for c in cols if c != 'LS']
         quant_cols_sorted = sorted(quant_cols, key=lambda x: int(x[1:]) if x.startswith('Q') and x[1:].isdigit() else 0)
 
-        # 绘制全部分组 + LS
+        # Plot all quantiles + LS
         plt.figure(figsize=(12, 6))
         for c in quant_cols_sorted:
             plt.plot(cum_df['date'], cum_df[c], color='#999999', linewidth=1.0, alpha=0.8, label=c if c in ['Q1','Q10'] else None)
@@ -638,7 +642,7 @@ class FactorRankICAnalyzer:
         plt.savefig(out_all, dpi=150)
         plt.close()
 
-        # 单独绘制LS（若存在）
+        # Separate LS plot (if available)
         if ls_col is not None and ls_col in cum_df.columns:
             plt.figure(figsize=(12, 6))
             plt.plot(cum_df['date'], cum_df[ls_col], color='#2ca02c', linewidth=2.0, label='LS')
@@ -657,7 +661,6 @@ class FactorRankICAnalyzer:
 
 
 def main():
-    """主函数"""
     import argparse
     import os
     from pathlib import Path
@@ -710,7 +713,7 @@ def main():
     
     args = parser.parse_args()
     
-    # 执行分析
+    # Run analysis
     analyzer = FactorRankICAnalyzer(args.data)
     analyzer.load_market_data() \
             .load_factor(args.factor) \
@@ -761,7 +764,7 @@ if __name__ == "__main__":
         print("Factor Rank IC Analysis Tool - Interactive Mode")
         print("="*80)
         
-        # 示例使用
+        # Example usage
         factor_file = 'factors_by_type/alpha101/WorldQuant_alpha002.pkl'
         
         print(f"\nExample: Analyzing factor {factor_file}")
@@ -780,7 +783,7 @@ if __name__ == "__main__":
                 .print_statistics() \
                 .save_results()
 
-        # 示例：运行10分位回测（可注释）
+        # Example: run 10-decile backtest
         analyzer.backtest_deciles(
             n_bins=10,
             exclude_st=True,
