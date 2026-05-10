@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import signal
 import subprocess
 import sys
 from datetime import datetime
@@ -43,6 +44,8 @@ CHAT_SYSTEM = (
 )
 
 DOTENV = ROOT / ".env"
+MINING_DIR = ROOT / "agent_runs" / "mining"
+MINING_UI_STATE = MINING_DIR / "ui_state.json"
 
 
 def _load_dotenv() -> None:
@@ -98,8 +101,72 @@ def _resolve_artifact_dir(artifact_dir: str) -> Path:
     return p.resolve()
 
 
+def _tail_text(path: Path, max_lines: int = 160) -> str:
+    if not path.is_file():
+        return ""
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception as e:
+        return f"Could not read log: {e}"
+    return "\n".join(lines[-max_lines:])
+
+
+def _process_running(proc: subprocess.Popen | None) -> bool:
+    return proc is not None and proc.poll() is None
+
+
+def _pid_running(pid: int | None) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except OSError:
+        return False
+
+
+def _read_mining_ui_state() -> dict:
+    if not MINING_UI_STATE.is_file():
+        return {}
+    try:
+        import json
+        return json.loads(MINING_UI_STATE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _write_mining_ui_state(run_dir: Path, pid: int | None = None) -> None:
+    import json
+    MINING_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "current_run_id": run_dir.name,
+        "current_run_dir": str(run_dir.resolve()),
+        "pid": int(pid) if pid else None,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    MINING_UI_STATE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _mining_run_dirs() -> list[Path]:
+    if not MINING_DIR.is_dir():
+        return []
+    markers = {"checkpoint.json", "ui_alpha_miner.log", "config_used.yaml", "mining_report.md", "top_factors.csv"}
+    dirs = []
+    for d in MINING_DIR.iterdir():
+        if not d.is_dir():
+            continue
+        if any((d / marker).exists() for marker in markers) or (d / "factors").is_dir():
+            dirs.append(d)
+    return sorted(
+        dirs,
+        key=lambda d: d.stat().st_mtime,
+        reverse=True,
+    )
+
+
 def _render_pipeline_artifacts(art: Path) -> None:
     """Show Rank IC table summary, charts, and decile plot images after a successful run."""
+    import json
     import pandas as pd
 
     st.subheader("Pipeline results")
@@ -108,6 +175,15 @@ def _render_pipeline_artifacts(art: Path) -> None:
     except ValueError:
         art_rel = art
     st.caption(f"Output folder: `{art_rel}`")
+    meta_path = art / "run_metadata.json"
+    if meta_path.is_file():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            inputs = meta.get("inputs", {})
+            horizon = "same-day diagnostic" if inputs.get("no_next_day") else "next-day forward"
+            st.caption(f"Rank IC return horizon: `{horizon}`")
+        except Exception:
+            pass
 
     rankic_files = sorted(art.glob("*_rankic.csv"), key=lambda x: x.stat().st_mtime, reverse=True)
     if not rankic_files:
@@ -167,6 +243,7 @@ def _render_pipeline_artifacts(art: Path) -> None:
 
 
 def _render_batch_artifacts(out_dir: Path) -> None:
+    import json
     import pandas as pd
 
     st.subheader("Batch analysis results")
@@ -175,6 +252,15 @@ def _render_batch_artifacts(out_dir: Path) -> None:
     except ValueError:
         out_rel = out_dir
     st.caption(f"Output folder: `{out_rel}`")
+    meta_path = out_dir / "run_metadata.json"
+    if meta_path.is_file():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            config = meta.get("config", {})
+            horizon = "next-day forward" if config.get("use_next_day_return", True) else "same-day diagnostic"
+            st.caption(f"Rank IC return horizon: `{horizon}`")
+        except Exception:
+            pass
     summary_path = out_dir / "summary.csv"
     if not summary_path.is_file():
         st.info("No `summary.csv` found in this folder yet.")
@@ -204,7 +290,11 @@ def _render_mining_run(run_dir: Path) -> None:
     st.subheader(f"Mining run: {run_dir.name}")
     cp = run_dir / "checkpoint.json"
     if not cp.is_file():
-        st.warning("Checkpoint not found.")
+        st.warning("Checkpoint not found yet. If the run just started, this is normal until the first generation finishes.")
+        log_path = run_dir / "ui_alpha_miner.log"
+        if log_path.is_file():
+            st.markdown("**Mining process log**")
+            st.code(_tail_text(log_path), language="text")
         return
 
     try:
@@ -213,24 +303,110 @@ def _render_mining_run(run_dir: Path) -> None:
         st.warning(f"Could not read checkpoint: {e}")
         return
 
+    config = state.get("config", {})
+    candidates = state.get("all_candidates", [])
+    survivors = set(state.get("survivors", []))
+    df = pd.DataFrame(candidates) if candidates else pd.DataFrame()
+
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Generations done", state.get("generations_done", 0))
     col2.metric("Best grade", state.get("best_grade", "?"))
     col3.metric("Best mean Rank IC", f"{state.get('best_mean_ric', 0):.4f}")
-    candidates = state.get("all_candidates", [])
     col4.metric("Total evaluated", len(candidates))
 
-    if candidates:
-        df = pd.DataFrame(candidates)
-        evaluated = df[df.get("error", pd.Series([""] * len(df))).fillna("") == ""] if "error" in df.columns else df
-        show_cols = [c for c in ["name", "generation", "origin", "grade", "mean_rank_ic",
-                                  "rank_ic_ir", "rank_ic_win_rate", "valid_days"] if c in df.columns]
-        if show_cols and "mean_rank_ic" in df.columns:
-            df_show = df[show_cols].copy()
+    q_enabled = bool(config.get("pipeline_queue_enabled", True))
+    outer_workers = int(config.get("outer_workers", 1) or 1)
+    queue_size = int(config.get("pipeline_queue_size", 0) or max(2, outer_workers * 2))
+    eval_workers = int(config.get("eval_workers", config.get("workers", 1)) or 1)
+    with st.expander("Producer / Consumer pipeline", expanded=True):
+        p1, p2, p3, p4 = st.columns(4)
+        p1.metric("Producer", "LLM + mutations")
+        p2.metric("Queue", f"{queue_size}" if q_enabled else "off")
+        p3.metric("Consumers", outer_workers)
+        p4.metric("IC workers / factor", eval_workers)
+        st.caption(
+            "Producer creates safe DSL/Python candidates, the bounded queue buffers them, "
+            "consumer workers run safety validation, factor evaluation, Rank IC/backtest, then write checkpoint and ledger."
+        )
+
+    if not df.empty:
+        if "error" in df.columns:
+            error_s = df["error"].fillna("").astype(str)
+            rejected = int((error_s != "").sum())
+        else:
+            rejected = 0
+        diversity_rejected = int(df.get("diversity_rejected", pd.Series([False] * len(df))).fillna(False).astype(bool).sum())
+        accepted = max(0, len(df) - rejected - diversity_rejected)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Accepted / clean", accepted)
+        m2.metric("Errors / unsafe", rejected)
+        m3.metric("Diversity rejected", diversity_rejected)
+        m4.metric("Survivors", len(survivors))
+
+        show_rejected = st.checkbox("Show rejected / errored candidates", value=True, key=f"{run_dir.name}_show_rejected")
+        family_filter = "all"
+        if "family" in df.columns:
+            families = ["all"] + sorted(x for x in df["family"].fillna("unknown").astype(str).unique() if x)
+            family_filter = st.selectbox("Family filter", families, key=f"{run_dir.name}_family_filter")
+
+        df_show = df.copy()
+        if not show_rejected and "error" in df_show.columns:
+            df_show = df_show[df_show["error"].fillna("").astype(str) == ""]
+        if family_filter != "all" and "family" in df_show.columns:
+            df_show = df_show[df_show["family"].fillna("unknown").astype(str) == family_filter]
+        if "mean_rank_ic" in df_show.columns:
             df_show["mean_rank_ic"] = pd.to_numeric(df_show["mean_rank_ic"], errors="coerce")
             df_show = df_show.sort_values("mean_rank_ic", key=abs, ascending=False, na_position="last")
-            st.markdown("**All evaluated factors (sorted by |mean Rank IC|)**")
-            st.dataframe(df_show.head(50), use_container_width=True)
+        if "name" in df_show.columns:
+            df_show["survivor"] = df_show["name"].isin(survivors)
+
+        show_cols = [
+            "survivor", "name", "generation", "origin", "family", "grade", "mean_rank_ic",
+            "rank_ic_ir", "rank_ic_win_rate", "recent_rank_ic", "train_rank_ic",
+            "validation_rank_ic", "test_rank_ic", "alpha_direction", "recommendation",
+            "expression", "max_similarity", "most_similar_to", "error",
+        ]
+        show_cols = [c for c in show_cols if c in df_show.columns]
+        st.markdown("**Evaluated factors and formulas**")
+        st.dataframe(df_show[show_cols].head(200), use_container_width=True, hide_index=True)
+
+        detail_names = df_show["name"].astype(str).tolist() if "name" in df_show.columns else []
+        if detail_names:
+            selected = st.selectbox("Inspect one factor", detail_names, key=f"{run_dir.name}_factor_detail")
+            row = df[df["name"].astype(str) == selected].iloc[0].to_dict()
+            d1, d2 = st.columns([1, 1])
+            with d1:
+                st.markdown("**Formula / hypothesis**")
+                st.code(str(row.get("expression") or row.get("canonical_expression") or ""), language="text")
+                if row.get("economic_hypothesis"):
+                    st.write(row.get("economic_hypothesis"))
+                if row.get("why_not_duplicate"):
+                    st.caption(f"Why not duplicate: {row.get('why_not_duplicate')}")
+            with d2:
+                st.markdown("**Diagnostics**")
+                diag = {
+                    "grade": row.get("grade"),
+                    "mean_rank_ic": row.get("mean_rank_ic"),
+                    "rank_ic_ir": row.get("rank_ic_ir"),
+                    "win_rate": row.get("rank_ic_win_rate"),
+                    "alpha_direction": row.get("alpha_direction"),
+                    "recommendation": row.get("recommendation"),
+                    "max_similarity": row.get("max_similarity"),
+                    "most_similar_to": row.get("most_similar_to"),
+                    "error": row.get("error"),
+                }
+                st.json(diag)
+
+            ic_path = Path(str(row.get("ic_csv_path") or ""))
+            if ic_path.is_file():
+                try:
+                    ic_df = pd.read_csv(ic_path, parse_dates=["date"])
+                    chart_cols = [c for c in ("rank_ic", "ic") if c in ic_df.columns]
+                    if chart_cols:
+                        st.markdown("**Selected factor daily IC**")
+                        st.line_chart(ic_df.set_index("date")[chart_cols].sort_index())
+                except Exception as e:
+                    st.warning(f"Could not read selected factor IC CSV: {e}")
 
     top_csv = run_dir / "top_factors.csv"
     if top_csv.is_file():
@@ -245,6 +421,11 @@ def _render_mining_run(run_dir: Path) -> None:
     if report.is_file():
         with st.expander("Mining report (markdown)"):
             st.markdown(report.read_text(encoding="utf-8"))
+
+    log_path = run_dir / "ui_alpha_miner.log"
+    if log_path.is_file():
+        with st.expander("Mining process log"):
+            st.code(_tail_text(log_path), language="text")
 
 
 def _stream_assistant(messages: list, model: str, temperature: float, provider: str = "openai"):
@@ -316,33 +497,56 @@ def main():
 
     gen_dir = ROOT / "generated_factors"
     gen_dir.mkdir(parents=True, exist_ok=True)
+    MINING_DIR.mkdir(parents=True, exist_ok=True)
 
-    for m in st.session_state.messages:
-        with st.chat_message(m["role"]):
-            st.markdown(m["content"])
+    if "mining_run_dir" not in st.session_state:
+        ui_state = _read_mining_ui_state()
+        saved_run_value = str(ui_state.get("current_run_dir") or "").strip()
+        saved_run_dir = Path(saved_run_value) if saved_run_value else None
+        if saved_run_dir is not None and saved_run_dir.is_dir():
+            st.session_state["mining_run_dir"] = str(saved_run_dir)
+        else:
+            latest_runs = _mining_run_dirs()
+            if latest_runs:
+                st.session_state["mining_run_dir"] = str(latest_runs[0])
 
-    if prompt := st.chat_input("Describe a factor, or ask for a revision…"):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+    with st.sidebar:
+        ui_view = st.radio(
+            "目录",
+            ["Chat / Pipeline", "Alpha Mining Console"],
+            key="ui_view",
+        )
 
-        api_messages = [{"role": "system", "content": CHAT_SYSTEM}]
+    if ui_view == "Chat / Pipeline":
         for m in st.session_state.messages:
-            api_messages.append({"role": m["role"], "content": m["content"]})
+            with st.chat_message(m["role"]):
+                st.markdown(m["content"])
 
-        with st.chat_message("assistant"):
-            text_holder = st.empty()
-            collected: list[str] = []
-            for token in _stream_assistant(
-                api_messages,
-                st.session_state.sb_model,
-                float(st.session_state.sb_temp),
-                provider=st.session_state.get("sb_provider", "openai"),
-            ):
-                collected.append(token)
-                text_holder.markdown("".join(collected))
-            full = "".join(collected)
-            st.session_state.messages.append({"role": "assistant", "content": full})
+        if prompt := st.chat_input("Describe a factor, or ask for a revision…"):
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+
+            api_messages = [{"role": "system", "content": CHAT_SYSTEM}]
+            for m in st.session_state.messages:
+                api_messages.append({"role": m["role"], "content": m["content"]})
+
+            with st.chat_message("assistant"):
+                text_holder = st.empty()
+                collected: list[str] = []
+                for token in _stream_assistant(
+                    api_messages,
+                    st.session_state.sb_model,
+                    float(st.session_state.sb_temp),
+                    provider=st.session_state.get("sb_provider", "openai"),
+                ):
+                    collected.append(token)
+                    text_holder.markdown("".join(collected))
+                full = "".join(collected)
+                st.session_state.messages.append({"role": "assistant", "content": full})
+    else:
+        st.subheader("Alpha Mining Console")
+        st.caption("Use the Alpha Miner controls in the sidebar to start/resume runs. Results update from checkpoint files.")
 
     last_code = None
     for m in reversed(st.session_state.messages):
@@ -406,6 +610,12 @@ def main():
             key="sb_pipeline_workers",
             help="Per-trading-day IC/decile tasks run in a process pool when >1. Factor pickle step stays single-process.",
         )
+        st.selectbox(
+            "Rank IC return horizon",
+            ["next-day forward", "same-day diagnostic"],
+            key="sb_pipeline_return_horizon",
+            help="Default is T signal vs T+1 return. Same-day is only for diagnostics.",
+        )
         st.divider()
         st.subheader("Export & run")
         save_name = st.text_input("Save as (.py)", value=st.session_state.save_stub, key="sb_save")
@@ -447,6 +657,8 @@ def main():
                 _device = str(st.session_state.get("sb_pipeline_device", "auto")).strip() or "auto"
                 _ui_provider = str(st.session_state.get("sb_provider", "openai"))
                 cmd.extend(["--backend", _backend, "--device", _device, "--provider", _ui_provider])
+                if st.session_state.get("sb_pipeline_return_horizon") == "same-day diagnostic":
+                    cmd.append("--no-next-day")
                 with st.spinner("Running pipeline…"):
                     proc = subprocess.run(
                         cmd,
@@ -501,6 +713,12 @@ def main():
             key="batch_ic_workers",
             help="Workers used inside each factor for per-day IC/decile tasks.",
         )
+        st.selectbox(
+            "Batch return horizon",
+            ["next-day forward", "same-day diagnostic"],
+            key="batch_return_horizon",
+            help="Default is T signal vs T+1 return. Same-day is only for diagnostics.",
+        )
         if st.button("Run batch analysis", use_container_width=True):
             batch_script = ROOT / "scripts" / "analysis" / "batch_factor_analysis.py"
             _factor_workers = int(st.session_state.get("batch_factor_workers", 1))
@@ -524,6 +742,8 @@ def main():
                 "--device",
                 _batch_device,
             ]
+            if st.session_state.get("batch_return_horizon") == "same-day diagnostic":
+                cmd.append("--no-next-day")
             with st.spinner("Running batch analysis…"):
                 proc = subprocess.run(
                     cmd,
@@ -541,20 +761,122 @@ def main():
                 st.error(f"Exit code {proc.returncode}")
         st.divider()
         st.subheader("Alpha Miner runs")
-        mining_dir = ROOT / "agent_runs" / "mining"
-        if mining_dir.is_dir():
-            run_dirs = sorted(
-                [d for d in mining_dir.iterdir() if d.is_dir() and (d / "checkpoint.json").is_file()],
-                key=lambda d: d.stat().st_mtime,
-                reverse=True,
+        mining_dir = MINING_DIR
+        ui_state = _read_mining_ui_state()
+        default_run_id = f"mining_ui_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        st.text_input("Run ID", value=default_run_id, key="alpha_mining_run_id")
+        st.text_input("Config", value=str(AGENT_DIR / "alpha_mining_config.yaml"), key="alpha_mining_config")
+        mcols = st.columns(2)
+        with mcols[0]:
+            st.number_input("Generations", min_value=1, max_value=50, value=1, step=1, key="alpha_mining_generations")
+            st.number_input("Outer consumers", min_value=1, max_value=_w_max, value=1, step=1, key="alpha_mining_outer_workers")
+        with mcols[1]:
+            st.number_input("Factors / gen", min_value=1, max_value=100, value=3, step=1, key="alpha_mining_per_gen")
+            st.text_input("Mining data", value=data_pkl, key="alpha_mining_data")
+
+        proc = st.session_state.get("alpha_mining_proc")
+        if _process_running(proc):
+            st.caption(f"Running PID: `{proc.pid}`")
+            if st.button("Stop current mining process", use_container_width=True):
+                proc.terminate()
+                st.warning("Stop signal sent.")
+        elif _pid_running(ui_state.get("pid")):
+            st.caption(f"Running PID from saved state: `{ui_state.get('pid')}`")
+            if st.button("Stop saved mining process", use_container_width=True):
+                try:
+                    os.kill(int(ui_state["pid"]), signal.SIGTERM)
+                    st.warning("Stop signal sent to saved PID.")
+                except Exception as e:
+                    st.error(f"Could not stop saved PID: {e}")
+        else:
+            if proc is not None:
+                rc = proc.poll()
+                st.caption(f"Last mining process exited: `{rc}`")
+
+        if st.button("Start alpha mining", use_container_width=True):
+            run_id = str(st.session_state.get("alpha_mining_run_id") or default_run_id).strip()
+            run_dir = mining_dir / run_id
+            run_dir.mkdir(parents=True, exist_ok=True)
+            log_path = run_dir / "ui_alpha_miner.log"
+            cmd = [
+                sys.executable,
+                str(AGENT_DIR / "alpha_miner.py"),
+                "start",
+                "--run-id",
+                run_id,
+                "--config",
+                str(st.session_state.get("alpha_mining_config") or AGENT_DIR / "alpha_mining_config.yaml"),
+                "--generations",
+                str(int(st.session_state.get("alpha_mining_generations", 1))),
+                "--per-gen",
+                str(int(st.session_state.get("alpha_mining_per_gen", 3))),
+                "--model",
+                str(st.session_state.get("sb_model", "gpt-4.1")),
+                "--provider",
+                str(st.session_state.get("sb_provider", "openai")),
+                "--outer-workers",
+                str(int(st.session_state.get("alpha_mining_outer_workers", 1))),
+                "--data",
+                str(st.session_state.get("alpha_mining_data") or data_pkl),
+            ]
+            log_f = open(log_path, "a", encoding="utf-8", buffering=1)
+            log_f.write(f"\n\n[{datetime.now().isoformat(timespec='seconds')}] RUN {' '.join(cmd)}\n")
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(ROOT),
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
             )
-            if run_dirs:
-                run_names = [d.name for d in run_dirs[:10]]
-                selected_run = st.selectbox("Select run", run_names, key="sb_mining_run")
-                if st.button("View mining results", use_container_width=True):
-                    st.session_state["mining_run_dir"] = str(mining_dir / selected_run)
-            else:
-                st.caption("No mining runs found.")
+            st.session_state["alpha_mining_proc"] = proc
+            st.session_state["mining_run_dir"] = str(run_dir)
+            _write_mining_ui_state(run_dir, proc.pid)
+            st.success(f"Alpha mining started: {run_id}")
+
+        run_dirs = _mining_run_dirs()
+        if run_dirs:
+            run_names = [d.name for d in run_dirs[:20]]
+            current_name = Path(str(st.session_state.get("mining_run_dir", ""))).name
+            default_index = run_names.index(current_name) if current_name in run_names else 0
+            selected_run = st.selectbox("Select run", run_names, index=default_index, key="sb_mining_run")
+            c_view, c_resume = st.columns(2)
+            with c_view:
+                if st.button("View", use_container_width=True):
+                    selected_dir = mining_dir / selected_run
+                    st.session_state["mining_run_dir"] = str(selected_dir)
+                    _write_mining_ui_state(selected_dir, ui_state.get("pid"))
+            with c_resume:
+                if st.button("Resume", use_container_width=True):
+                    run_dir = mining_dir / selected_run
+                    log_path = run_dir / "ui_alpha_miner.log"
+                    cmd = [
+                        sys.executable,
+                        str(AGENT_DIR / "alpha_miner.py"),
+                        "resume",
+                        "--run-id",
+                        selected_run,
+                        "--config",
+                        str(st.session_state.get("alpha_mining_config") or AGENT_DIR / "alpha_mining_config.yaml"),
+                    ]
+                    log_f = open(log_path, "a", encoding="utf-8", buffering=1)
+                    log_f.write(f"\n\n[{datetime.now().isoformat(timespec='seconds')}] RUN {' '.join(cmd)}\n")
+                    proc = subprocess.Popen(
+                        cmd,
+                        cwd=str(ROOT),
+                        stdout=log_f,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    st.session_state["alpha_mining_proc"] = proc
+                    st.session_state["mining_run_dir"] = str(run_dir)
+                    _write_mining_ui_state(run_dir, proc.pid)
+                    st.success(f"Resume started: {selected_run}")
+            if st.button("Refresh mining view", use_container_width=True):
+                st.rerun()
         else:
             st.caption("No mining runs found.")
         st.divider()

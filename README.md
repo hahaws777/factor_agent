@@ -93,8 +93,10 @@ The UI supports:
 Single-factor Rank IC analysis:
 
 ```bash
-python scripts/analysis/factor_rankic_analysis.py --factor path/to/factor.pkl --next-day
+python scripts/analysis/factor_rankic_analysis.py --factor path/to/factor.pkl
 ```
+
+Rank IC defaults to next-day forward return. Add `--same-day` only for diagnostic same-day analysis.
 
 Batch analysis:
 

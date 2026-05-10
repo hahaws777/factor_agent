@@ -50,11 +50,7 @@ def load_factor_csv(csv_path: str) -> pd.DataFrame:
 def compute_forward_return(df: pd.DataFrame, close_col: str = "close", forward: int = 1) -> pd.Series:
     """Compute next-period return by (order_book_id, date)."""
     df = df.sort_values(["order_book_id", "date"])
-    out = (
-        df.groupby("order_book_id")[close_col]
-        .pct_change(periods=forward)
-        .shift(-forward)
-    )
+    out = df.groupby("order_book_id", sort=False)[close_col].shift(-forward) / df[close_col] - 1.0
     return out
 
 
@@ -184,7 +180,7 @@ def load_market_return_for_npz(market_npz: Path = None, market_csv: Path = None)
             return None
         df["date"] = pd.to_datetime(df["date"])
         df = df.sort_values(["order_book_id", "date"])
-        df["return_next"] = df.groupby("order_book_id")["close"].pct_change().shift(-1)
+        df["return_next"] = df.groupby("order_book_id", sort=False)["close"].shift(-1) / df["close"] - 1.0
         return df[["order_book_id", "date", "return_next"]].dropna()
     return None
 

@@ -10,23 +10,37 @@ import pandas as pd
 import numpy as np
 import pickle
 import os
-from scipy.stats import spearmanr
-from scipy.stats import t as student_t
+import math
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
-import matplotlib.pyplot as plt
 
 try:
-    import torch
+    import matplotlib.pyplot as plt
 except Exception:
-    torch = None
+    plt = None
+
+try:
+    from scipy.stats import t as student_t
+except Exception:
+    student_t = None
+
+torch = None
 
 log = logging.getLogger(__name__)
 
 MIN_STOCKS_PER_DAY = 50        # days with fewer stocks are dropped from IC
 IC_VALID_BOUND = 1 - 1e-6      # |IC| must be below this to compute p-value
 MIN_MERGE_OVERLAP = 0.05       # warn if merged rows < this fraction of factor rows
+MARKET_REQUIRED_COLUMNS = [
+    'order_book_id',
+    'date',
+    'close',
+    'ST',
+    'limit_up_flag',
+    'limit_down_flag',
+    'suspended',
+]
 
 def _parallel_ic_calc(args):
     d, g, factor_name = args
@@ -39,6 +53,25 @@ def _parallel_ic_calc(args):
     g2['r_rank'] = g2['return'].rank(method='average')
     rank_ic_val = g2['f_rank'].corr(g2['r_rank'])
     return (d, n, ic_val, rank_ic_val)
+
+
+def _corr_p_values(r_values, n_values) -> np.ndarray:
+    """Two-sided p-values for correlations; scipy if present, normal approximation otherwise."""
+    r = np.asarray(r_values, dtype=float)
+    n = np.asarray(n_values, dtype=float)
+    p_val = np.full(len(r), np.nan, dtype=float)
+    valid = np.isfinite(r) & (np.abs(r) < IC_VALID_BOUND) & (n > 2)
+    if not valid.any():
+        return p_val
+    df = n[valid] - 2
+    rv = r[valid]
+    t_stat = np.abs(rv) * np.sqrt(df / (1 - rv * rv))
+    if student_t is not None:
+        p_val[valid] = 2 * student_t.sf(t_stat, df)
+    else:
+        # The cross-section is large in this workflow, so this is a close fallback.
+        p_val[valid] = np.array([math.erfc(float(t) / math.sqrt(2.0)) for t in t_stat], dtype=float)
+    return p_val
 
 def _parallel_decile_calc(args):
     d, g, factor_name, n_bins = args
@@ -80,6 +113,13 @@ def _torch_rank_dense(x: "torch.Tensor") -> "torch.Tensor":
 
 
 def _resolve_torch_device(device: str) -> str:
+    global torch
+    if torch is None:
+        try:
+            import torch as _torch
+            torch = _torch
+        except Exception as e:
+            raise ImportError("PyTorch is not installed. Please install torch first.") from e
     if torch is None:
         raise ImportError("PyTorch is not installed. Please install torch first.")
     if device == "auto":
@@ -154,15 +194,32 @@ class FactorRankICAnalyzer:
         self.backtest_daily_returns = None
         self.backtest_cum_returns = None
 
-    def _prepare_market_index(self, copy_data=True):
-        """Prepare cached MultiIndex market table for faster joins."""
+    def _prepare_market_index(self, copy_data=True, keep_required_only=True):
+        """Prepare cached MultiIndex market table for faster joins.
+
+        Rank IC and decile backtests only need close plus filter flags. Keeping
+        the full market panel here creates a very large join/reset_index copy.
+        """
         if self.market_data is None:
             raise ValueError("Market data is not loaded.")
         md = self.market_data
+        if keep_required_only:
+            keep = [c for c in MARKET_REQUIRED_COLUMNS if c in md.columns]
+            missing = [c for c in ('order_book_id', 'date', 'close') if c not in keep]
+            if missing:
+                raise ValueError(f"Market data missing required columns: {missing}")
+            md = md[keep]
         if copy_data:
             md = md.copy()
         md['date'] = pd.to_datetime(md['date']).dt.normalize()
         md['order_book_id'] = md['order_book_id'].astype(str)
+        for col in ('ST', 'suspended'):
+            if col in md.columns:
+                md[col] = md[col].fillna(False).astype(bool)
+        for col in ('limit_up_flag', 'limit_down_flag'):
+            if col in md.columns:
+                # Treat NaN as not limited, matching the existing `!= True` semantics.
+                md[col] = md[col].eq(True)
         self.market_data = md
         self.market_data_indexed = md.set_index(['order_book_id', 'date']).sort_index()
         return self
@@ -192,10 +249,11 @@ class FactorRankICAnalyzer:
             self.market_data = pickle.load(f)
         self._prepare_market_index()
 
-        log.info("Market data loaded: shape=%s  date range: %s to %s",
+        log.info("Market data loaded: shape=%s  date range: %s to %s  columns=%s",
                  self.market_data.shape,
                  self.market_data['date'].min(),
-                 self.market_data['date'].max())
+                 self.market_data['date'].max(),
+                 list(self.market_data.columns))
         return self
     
     def load_factor(self, factor_file):
@@ -225,21 +283,27 @@ class FactorRankICAnalyzer:
         if not isinstance(self.factor_data.index, pd.MultiIndex):
             raise ValueError("Factor data must have MultiIndex (order_book_id, date)")
 
-        factor_df = self.factor_data.copy()
-        factor_df = factor_df.reset_index()
-        factor_df.columns = ['order_book_id', 'date', self.factor_name]
-        factor_df['order_book_id'] = factor_df['order_book_id'].astype(str)
-        factor_df['date'] = pd.to_datetime(factor_df['date']).dt.normalize()
-        factor_indexed = factor_df.set_index(['order_book_id', 'date'])[[self.factor_name]]
+        factor_indexed = self.factor_data[[self.factor_name]].dropna()
+        if factor_indexed.index.names != ['order_book_id', 'date']:
+            factor_indexed = factor_indexed.copy()
+            factor_indexed.index = factor_indexed.index.set_names(['order_book_id', 'date'])
+        if not pd.api.types.is_datetime64_any_dtype(factor_indexed.index.get_level_values('date')):
+            factor_df = factor_indexed.reset_index()
+            factor_df['order_book_id'] = factor_df['order_book_id'].astype(str)
+            factor_df['date'] = pd.to_datetime(factor_df['date']).dt.normalize()
+            factor_indexed = factor_df.set_index(['order_book_id', 'date'])[[self.factor_name]]
 
         self.merged_data = self.market_data_indexed.join(factor_indexed, how='inner').reset_index()
+        self.merged_data['order_book_id'] = self.merged_data['order_book_id'].astype('category')
 
-        overlap = len(self.merged_data) / max(len(factor_df), 1)
+        overlap = len(self.merged_data) / max(len(factor_indexed), 1)
         if overlap < MIN_MERGE_OVERLAP:
             log.warning("Low merge overlap: %.1f%% of factor rows matched market data. "
                         "Check date formats and stock ID conventions.", overlap * 100)
 
-        log.info("Merged data shape: %s", self.merged_data.shape)
+        mem_mb = self.merged_data.memory_usage(deep=True).sum() / 1024 ** 2
+        log.info("Merged data shape: %s  memory=%.1f MB  columns=%s",
+                 self.merged_data.shape, mem_mb, list(self.merged_data.columns))
         return self
     
     def calculate_rank_ic(self, 
@@ -247,7 +311,7 @@ class FactorRankICAnalyzer:
                          exclude_limit_up=True, 
                          exclude_limit_down=True,
                          exclude_suspended=True,
-                         use_next_day_return=False,
+                         use_next_day_return=True,
                          workers=None,
                          backend='pandas',
                          device='auto'):
@@ -272,17 +336,16 @@ class FactorRankICAnalyzer:
                  exclude_suspended, use_next_day_return, backend,
                  f" device={device}" if backend == 'torch' else "")
         
-        data = self.merged_data.copy()
-
-        data = data.sort_values(['order_book_id', 'date'])
+        data = self.merged_data.sort_values(['order_book_id', 'date']).copy()
         if use_next_day_return:
-            data['return'] = data.groupby('order_book_id')['close'].pct_change(1, fill_method=None).shift(-1)
+            by_stock = data.groupby('order_book_id', observed=True)
+            data['return'] = by_stock['close'].shift(-1) / data['close'] - 1.0
             # Pre-compute next-day limit flags before any row drops
             if exclude_limit_up or exclude_limit_down:
-                data['_next_luf'] = data.groupby('order_book_id')['limit_up_flag'].shift(-1)
-                data['_next_ldf'] = data.groupby('order_book_id')['limit_down_flag'].shift(-1)
+                data['_next_luf'] = by_stock['limit_up_flag'].shift(-1)
+                data['_next_ldf'] = by_stock['limit_down_flag'].shift(-1)
         else:
-            data['return'] = data.groupby('order_book_id')['close'].pct_change(1, fill_method=None)
+            data['return'] = data.groupby('order_book_id', observed=True)['close'].pct_change(1, fill_method=None)
 
         # Filter: ST and suspended are proper bool columns — astype(bool) is safe.
         # limit_up_flag / limit_down_flag are object dtype with possible NaN values;
@@ -309,6 +372,7 @@ class FactorRankICAnalyzer:
                 data = data[data['_next_ldf'] != True]
 
         data = data.dropna(subset=[self.factor_name, 'return'])
+        data = data[['date', self.factor_name, 'return']]
         
         log.info("Valid records after filtering: %d", len(data))
 
@@ -320,45 +384,25 @@ class FactorRankICAnalyzer:
             log.info("Using torch backend on device: %s", resolved_device)
             rows = _torch_calc_rows_by_segments(data, self.factor_name, resolved_device)
         else:
-            # Pre-group by date so workers don't repeat the filter step
-            grouped = list((d, g[[self.factor_name, 'return']].copy()) for d, g in data.groupby('date', sort=True))
-            tasks = [(d, g, self.factor_name) for d, g in grouped]
+            # Avoid materialising all per-day group DataFrames at once. On a
+            # 20M-row panel, list(groupby(...)) can add several GB of peak RAM.
+            tasks = (
+                (d, g[[self.factor_name, 'return']].copy(), self.factor_name)
+                for d, g in data.groupby('date', sort=True)
+            )
             if workers is None or workers <= 1:
                 rows = [_parallel_ic_calc(it) for it in tasks]
             else:
                 max_workers = min(int(workers), max(1, multiprocessing.cpu_count()))
                 with ProcessPoolExecutor(max_workers=max_workers) as ex:
-                    rows = list(ex.map(_parallel_ic_calc, tasks, chunksize=1))
+                    rows = list(ex.map(_parallel_ic_calc, tasks, chunksize=8))
 
         result = pd.DataFrame(rows, columns=['date', 'n_stocks', 'ic', 'rank_ic'])
 
         result = result[result['n_stocks'] >= MIN_STOCKS_PER_DAY].copy()
 
-        valid = (
-            result['rank_ic'].notna() &
-            (result['rank_ic'].abs() < IC_VALID_BOUND) &
-            (result['n_stocks'] > 2)
-        )
-        t_stat = np.full(len(result), np.nan, dtype=float)
-        df = result.loc[valid, 'n_stocks'].values - 2
-        r = result.loc[valid, 'rank_ic'].values
-        t_stat_valid = np.abs(r) * np.sqrt(df / (1 - r * r))
-        t_stat[valid.values] = t_stat_valid
-        p_val = np.full(len(result), np.nan, dtype=float)
-        p_val[valid.values] = 2 * student_t.sf(t_stat_valid, df)
-        result['p_value'] = p_val
-
-        valid_ic = (
-            result['ic'].notna() &
-            (result['ic'].abs() < IC_VALID_BOUND) &
-            (result['n_stocks'] > 2)
-        )
-        df_ic = result.loc[valid_ic, 'n_stocks'].values - 2
-        r_ic = result.loc[valid_ic, 'ic'].values
-        t_stat_ic = np.abs(r_ic) * np.sqrt(df_ic / (1 - r_ic * r_ic))
-        p_val_ic = np.full(len(result), np.nan, dtype=float)
-        p_val_ic[valid_ic.values] = 2 * student_t.sf(t_stat_ic, df_ic)
-        result['ic_p_value'] = p_val_ic
+        result['p_value'] = _corr_p_values(result['rank_ic'].values, result['n_stocks'].values)
+        result['ic_p_value'] = _corr_p_values(result['ic'].values, result['n_stocks'].values)
 
         # NaN IC days (torch path may produce NaN for degenerate slices) → 0
         # so that downstream mean/std are computed over all valid days consistently.
@@ -474,12 +518,13 @@ class FactorRankICAnalyzer:
 
         data = data.sort_values(['order_book_id', 'date'])
         if use_next_day_return:
-            data['return'] = data.groupby('order_book_id')['close'].pct_change(1, fill_method=None).shift(-1)
+            by_stock = data.groupby('order_book_id', observed=True)
+            data['return'] = by_stock['close'].shift(-1) / data['close'] - 1.0
             if exclude_limit_up or exclude_limit_down:
-                data['_next_luf'] = data.groupby('order_book_id')['limit_up_flag'].shift(-1)
-                data['_next_ldf'] = data.groupby('order_book_id')['limit_down_flag'].shift(-1)
+                data['_next_luf'] = by_stock['limit_up_flag'].shift(-1)
+                data['_next_ldf'] = by_stock['limit_down_flag'].shift(-1)
         else:
-            data['return'] = data.groupby('order_book_id')['close'].pct_change(1, fill_method=None)
+            data['return'] = data.groupby('order_book_id', observed=True)['close'].pct_change(1, fill_method=None)
 
         if exclude_st:
             data = data[~data['ST'].astype(bool)]
@@ -500,16 +545,19 @@ class FactorRankICAnalyzer:
         if data.empty:
             raise ValueError("No valid data for backtest after filtering.")
 
-        # Quantile-bin within each date
-        grouped = list((d, g[['order_book_id', self.factor_name, 'return']].copy()) for d, g in data.groupby('date', sort=True))
-        tasks = [(d, g, self.factor_name, n_bins) for d, g in grouped]
+        # Quantile-bin within each date. Keep this lazy to avoid materialising
+        # thousands of copied daily frames before workers consume them.
+        tasks = (
+            (d, g[['order_book_id', self.factor_name, 'return']].copy(), self.factor_name, n_bins)
+            for d, g in data.groupby('date', sort=True)
+        )
 
         if workers is None or workers <= 1:
             rows = [_parallel_decile_calc(it) for it in tasks]
         else:
             max_workers = min(int(workers), max(1, multiprocessing.cpu_count()))
             with ProcessPoolExecutor(max_workers=max_workers) as ex:
-                rows = list(ex.map(_parallel_decile_calc, tasks, chunksize=1))
+                rows = list(ex.map(_parallel_decile_calc, tasks, chunksize=8))
 
         # Build DataFrame from per-day results
         records = []
@@ -611,6 +659,9 @@ class FactorRankICAnalyzer:
         if output_dir is None:
             output_dir = 'backtest_plots'
         os.makedirs(output_dir, exist_ok=True)
+        if plt is None:
+            print("matplotlib is not installed; skipping backtest plots.")
+            return self
 
         if prefix is None:
             prefix = getattr(self, 'factor_name', 'factor')
@@ -680,8 +731,8 @@ def main():
                        help='Do not exclude limit-down stocks')
     parser.add_argument('--no-filter-suspended', action='store_true',
                        help='Do not exclude suspended stocks')
-    parser.add_argument('--next-day', action='store_true',
-                       help='Use next day return (forward-looking)')
+    parser.add_argument('--same-day', action='store_true',
+                       help='Use same-day return instead of next-day forward return (default: next-day)')
     parser.add_argument('--output', type=str, default=None,
                        help='Output file path (default: auto-generated)')
     parser.add_argument('--workers', type=int, default=None,
@@ -723,7 +774,7 @@ def main():
                 exclude_limit_up=not args.no_filter_limit_up,
                 exclude_limit_down=not args.no_filter_limit_down,
                 exclude_suspended=not args.no_filter_suspended,
-                use_next_day_return=args.next_day,
+                use_next_day_return=not args.same_day,
                 workers=args.workers,
                 backend=args.backend,
                 device=args.device
@@ -801,8 +852,7 @@ if __name__ == "__main__":
         # print("  --no-filter-limit-up    : Do not exclude limit-up stocks")
         # print("  --no-filter-limit-down  : Do not exclude limit-down stocks")
         # print("  --no-filter-suspended   : Do not exclude suspended stocks")
-        # print("  --next-day              : Use next day return")
+        # print("  --same-day             : Use same-day return instead of next-day forward return")
         # print("  --output <file>         : Output file path")
     else:
         main()
-

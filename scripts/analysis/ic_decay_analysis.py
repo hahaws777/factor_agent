@@ -134,11 +134,8 @@ class ICDecayAnalyzer:
         # Precompute all forward-return columns at once
         for h in horizons:
             col = f"ret_{h}d"
-            data[col] = (
-                data.groupby("order_book_id")["close"]
-                .pct_change(periods=h, fill_method=None)
-                .shift(-h)
-            )
+            by_stock = data.groupby("order_book_id", sort=False)
+            data[col] = by_stock["close"].shift(-h) / data["close"] - 1.0
 
         rows = []
         for h in horizons:

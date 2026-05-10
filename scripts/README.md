@@ -72,9 +72,9 @@ Notes:
 
 ```bash
 cd /d e:\data
-python scripts\analysis\factor_rankic_analysis.py --factor factors_by_type\alpha101\xxx.pkl --data data.pkl --next-day --backtest-decile
+python scripts\analysis\factor_rankic_analysis.py --factor factors_by_type\alpha101\xxx.pkl --data data.pkl --backtest-decile
 
-python scripts\analysis\factor_rankic_analysis.py --factor agent_runs\random_factor_test\random_noise_factor.pkl --data data.pkl --next-day --backend torch --device cuda --output agent_runs\random_factor_test\random_noise_factor_rankic_torch_cuda.csv
+python scripts\analysis\factor_rankic_analysis.py --factor agent_runs\random_factor_test\random_noise_factor.pkl --data data.pkl --backend torch --device cuda --output agent_runs\random_factor_test\random_noise_factor_rankic_torch_cuda.csv
 
 python scripts\composite\factor_composite_pca_lgb.py --decile_dir decile_cpp_batch_results
 

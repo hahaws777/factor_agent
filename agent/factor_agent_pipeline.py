@@ -167,8 +167,8 @@ def run_rank_ic_backtest(
         "--data",
         str(data_pkl.resolve()),
     ]
-    if next_day:
-        cmd.append("--next-day")
+    if not next_day:
+        cmd.append("--same-day")
     if out_csv:
         cmd.extend(["--output", str(out_csv)])
     if backtest_decile:
