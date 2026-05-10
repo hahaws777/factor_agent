@@ -84,6 +84,7 @@ class MiningConfig:
     max_expression_depth: int = 8
     max_expression_nodes: int = 80
     max_lookback_window: int = 252
+    use_prepared_recipes: bool = True
     # mutation
     mutation_enabled: bool = True
     window_sweeps: list = field(default_factory=lambda: [5, 10, 20, 60])
@@ -157,6 +158,7 @@ class MiningConfig:
         cfg.max_expression_depth = g.get("max_expression_depth", cfg.max_expression_depth)
         cfg.max_expression_nodes = g.get("max_expression_nodes", cfg.max_expression_nodes)
         cfg.max_lookback_window = g.get("max_lookback_window", cfg.max_lookback_window)
+        cfg.use_prepared_recipes = g.get("use_prepared_recipes", cfg.use_prepared_recipes)
 
         mut = raw.get("mutation", {})
         cfg.mutation_enabled = mut.get("enabled", cfg.mutation_enabled)
@@ -439,6 +441,54 @@ Required JSON schema:
         for s in survivors[:8]:
             detail = s.expression or s.economic_hypothesis or s.name
             base += f"- {s.name}: family={s.family}, sign={s.expected_sign}, expr={detail[:240]}\n"
+    return base
+
+
+def _extract_json_object(text: str) -> dict:
+    text = text.strip()
+    fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+    if fenced:
+        text = fenced.group(1).strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("response did not contain a JSON object")
+    return json.loads(text[start:end + 1])
+
+
+def _build_recipe_selection_prompt(
+    description: str,
+    survivors: list[FactorCandidate],
+    factor_type_hint: str,
+    recipes_text: str,
+) -> str:
+    base = f"""Choose ONE prepared alpha recipe. Return strict JSON only.
+
+Description: {description.strip()}
+Preferred family: {factor_type_hint}
+
+Prepared recipe library:
+{recipes_text}
+
+Rules:
+- Do not invent or edit formulas.
+- Do not output Python code.
+- Choose exactly one recipe_id from the library above.
+- Use why_not_duplicate to explain why this choice is not too similar to existing accepted factors.
+
+Required JSON schema:
+{{
+  "recipe_id": "one_recipe_id_from_library",
+  "name_suffix": "optional_short_ascii_suffix",
+  "economic_hypothesis": "optional refinement of the recipe hypothesis",
+  "why_not_duplicate": "..."
+}}
+"""
+    if survivors:
+        base += "\nExisting accepted factors to avoid duplicating:\n"
+        for s in survivors[:10]:
+            detail = s.expression or s.economic_hypothesis or s.name
+            base += f"- {s.name}: family={s.family}, expr={detail[:240]}, mean_rank_ic={s.mean_rank_ic:.4f}\n"
     return base
 
 
@@ -838,6 +888,7 @@ class AlphaMiner:
         """Yield generated candidates one by one so evaluation can overlap LLM calls."""
         from factor_code_agent import extract_python_code, validate_python_syntax
         from factor_dsl import DSLConfig, FactorSpec, compile_expression_to_module, validate_expression
+        from factor_recipe_library import recipe_by_id, recipes_for_prompt, select_recipe
 
         factor_types = self.cfg.extra_factor_types
         dsl_cfg = DSLConfig(
@@ -863,7 +914,15 @@ class AlphaMiner:
             desc = next(prompt_cycle)
             ft_hint = factor_types[i % len(factor_types)]
             if self.cfg.generation_mode == "dsl":
-                user_msg = _build_dsl_generation_prompt(desc, survivors, ft_hint, self.cfg)
+                if self.cfg.use_prepared_recipes:
+                    user_msg = _build_recipe_selection_prompt(
+                        desc,
+                        survivors,
+                        ft_hint,
+                        recipes_for_prompt(ft_hint, limit=12),
+                    )
+                else:
+                    user_msg = _build_dsl_generation_prompt(desc, survivors, ft_hint, self.cfg)
             else:
                 user_msg = _build_generation_prompt(desc, survivors, ft_hint)
 
@@ -878,7 +937,24 @@ class AlphaMiner:
             validation = None
             if self.cfg.generation_mode == "dsl":
                 try:
-                    spec = FactorSpec.from_json_text(raw)
+                    if self.cfg.use_prepared_recipes:
+                        selection = _extract_json_object(raw)
+                        recipe = recipe_by_id(str(selection.get("recipe_id") or ""))
+                        if recipe is None:
+                            used_expr = {
+                                re.sub(r"\s+", "", s.canonical_expression or s.expression)
+                                for s in survivors
+                                if s.expression
+                            }
+                            recipe = select_recipe(ft_hint, i, used_expr)
+                            log.warning("LLM selected unknown recipe_id; falling back to %s", recipe.recipe_id)
+                        spec = recipe.to_spec(
+                            name_suffix=str(selection.get("name_suffix") or ""),
+                            economic_hypothesis=str(selection.get("economic_hypothesis") or ""),
+                            why_not_duplicate=str(selection.get("why_not_duplicate") or ""),
+                        )
+                    else:
+                        spec = FactorSpec.from_json_text(raw)
                     validation = validate_expression(spec.expression, dsl_cfg)
                     if not validation.is_valid:
                         log.warning("Invalid DSL expression from LLM: %s", "; ".join(validation.errors))
@@ -904,13 +980,13 @@ class AlphaMiner:
             c = FactorCandidate(
                 name=name, code=code, code_hash=h,
                 generation=generation,
-                origin="dsl" if spec else "llm",
+                origin="recipe" if (spec and self.cfg.use_prepared_recipes) else ("dsl" if spec else "llm"),
                 family=spec.family if spec else ft_hint,
                 economic_hypothesis=spec.economic_hypothesis if spec else "",
                 expression=spec.expression if spec else "",
                 canonical_expression=validation.canonical_expression if validation else "",
                 expected_sign=spec.expected_sign if spec else "unknown",
-                required_fields=validation.required_fields if validation else [],
+                required_fields=sorted(set((validation.required_fields if validation else []) + (spec.required_fields if spec else []))),
                 lookback_windows=validation.lookback_windows if validation else [],
                 risk_notes=spec.risk_notes if spec else [],
                 why_not_duplicate=spec.why_not_duplicate if spec else "",

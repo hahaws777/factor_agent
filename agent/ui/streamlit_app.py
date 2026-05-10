@@ -547,6 +547,25 @@ def main():
     else:
         st.subheader("Alpha Mining Console")
         st.caption("Use the Alpha Miner controls in the sidebar to start/resume runs. Results update from checkpoint files.")
+        with st.expander("Prepared formula recipe library"):
+            try:
+                import pandas as pd
+                from factor_recipe_library import PREPARED_FACTOR_RECIPES
+
+                recipe_df = pd.DataFrame([
+                    {
+                        "recipe_id": r.recipe_id,
+                        "family": r.family,
+                        "name": r.name,
+                        "expected_sign": r.expected_sign,
+                        "expression": r.expression,
+                    }
+                    for r in PREPARED_FACTOR_RECIPES
+                ])
+                st.dataframe(recipe_df, use_container_width=True, hide_index=True)
+                st.caption("DSL mining asks the LLM to choose recipe_id; the system expands the expression locally.")
+            except Exception as e:
+                st.warning(f"Could not load prepared recipe library: {e}")
 
     last_code = None
     for m in reversed(st.session_state.messages):

@@ -16,6 +16,7 @@ generation:
   max_expression_depth: 8
   max_expression_nodes: 80
   max_lookback_window: 252
+  use_prepared_recipes: true  # LLM chooses from prepared DSL formula recipes instead of inventing common formulas
   seed_prompts:             # Round-0 starting prompts (overridden by survivors in later rounds)
     - "20-day price momentum: past 20-day return, cross-sectionally ranked"
     - "short-term reversal: negative 5-day return, winsorized 1-99%"
