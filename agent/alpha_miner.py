@@ -67,6 +67,9 @@ class MiningConfig:
     min_rank_ic: float = 0.015
     diversity_penalty: bool = True
     diversity_corr_threshold: float = 0.90
+    exploration_ratio: float = 0.6
+    min_llm_new_per_generation: int = 4
+    mutation_budget_ratio: float = 0.4
     # generation
     seed_prompts: list = field(default_factory=lambda: [
         "20-day price momentum: past 20-day cumulative return, cross-sectionally ranked",
@@ -85,6 +88,7 @@ class MiningConfig:
     max_expression_nodes: int = 80
     max_lookback_window: int = 252
     use_prepared_recipes: bool = True
+    diversity_modes: list = field(default_factory=lambda: ["recipe", "free_dsl", "crossover", "hypothesis_first"])
     # mutation
     mutation_enabled: bool = True
     window_sweeps: list = field(default_factory=lambda: [5, 10, 20, 60])
@@ -147,6 +151,9 @@ class MiningConfig:
         cfg.min_rank_ic = m.get("min_rank_ic", cfg.min_rank_ic)
         cfg.diversity_penalty = m.get("diversity_penalty", cfg.diversity_penalty)
         cfg.diversity_corr_threshold = m.get("diversity_corr_threshold", cfg.diversity_corr_threshold)
+        cfg.exploration_ratio = m.get("exploration_ratio", cfg.exploration_ratio)
+        cfg.min_llm_new_per_generation = m.get("min_llm_new_per_generation", cfg.min_llm_new_per_generation)
+        cfg.mutation_budget_ratio = m.get("mutation_budget_ratio", cfg.mutation_budget_ratio)
 
         g = raw.get("generation", {})
         if g.get("seed_prompts"):
@@ -159,6 +166,7 @@ class MiningConfig:
         cfg.max_expression_nodes = g.get("max_expression_nodes", cfg.max_expression_nodes)
         cfg.max_lookback_window = g.get("max_lookback_window", cfg.max_lookback_window)
         cfg.use_prepared_recipes = g.get("use_prepared_recipes", cfg.use_prepared_recipes)
+        cfg.diversity_modes = g.get("diversity_modes", cfg.diversity_modes)
 
         mut = raw.get("mutation", {})
         cfg.mutation_enabled = mut.get("enabled", cfg.mutation_enabled)
@@ -265,6 +273,8 @@ class FactorCandidate:
     safety_severity: str = ""
     safety_reasons: list[str] = field(default_factory=list)
     suspicious_patterns: list[str] = field(default_factory=list)
+    structure_signature: str = ""
+    novelty_score: float = 1.0
 
     def passes(self, cfg: MiningConfig) -> bool:
         grade_ok = GRADE_ORDER.get(self.grade, 0) >= GRADE_ORDER.get(cfg.min_grade, 0)
@@ -293,6 +303,7 @@ class MiningState:
     survivors: list[str] = field(default_factory=list)         # names of current survivors
     seen_hashes: list[str] = field(default_factory=list)       # dedup registry
     seen_expressions: list[str] = field(default_factory=list)  # pre-eval expression dedup
+    seen_structures: list[str] = field(default_factory=list)   # pre-eval structural dedup
     best_grade: str = "F"
     best_mean_ric: float = 0.0
 
@@ -320,6 +331,99 @@ def _code_hash(code: str) -> str:
 def _sanitize_name_suffix(s: str, max_len: int = 20) -> str:
     """Strip non-alphanumeric/underscore chars to prevent path injection in filenames."""
     return re.sub(r"[^a-zA-Z0-9_]", "", s)[:max_len]
+
+
+def _structure_signature(expr: str) -> str:
+    """Normalize a DSL expression so parameter-only variants share one signature."""
+    compact = re.sub(r"\s+", "", str(expr or ""))
+    if not compact:
+        return ""
+    compact = re.sub(r"lower=[+-]?\d+(?:\.\d+)?", "lower=P", compact)
+    compact = re.sub(r"upper=[+-]?\d+(?:\.\d+)?", "upper=P", compact)
+    compact = re.sub(r",?lower=P", "", compact)
+    compact = re.sub(r",?upper=P", "", compact)
+    compact = re.sub(r"(?<![A-Za-z_])\d+(?![A-Za-z_])", "N", compact)
+    return compact
+
+
+def _expression_ops(expr: str) -> set[str]:
+    """Extract DSL operator names from an expression."""
+    try:
+        import ast
+        tree = ast.parse(expr or "", mode="eval")
+    except SyntaxError:
+        return set(re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", expr or ""))
+
+    ops: set[str] = set()
+
+    class Visitor(ast.NodeVisitor):
+        def visit_Call(self, node):
+            if isinstance(node.func, ast.Name):
+                ops.add(node.func.id)
+            self.generic_visit(node)
+
+    Visitor().visit(tree)
+    return ops
+
+
+def _candidate_fields(candidate: "FactorCandidate") -> set[str]:
+    fields = set(candidate.required_fields or [])
+    if not fields and candidate.expression:
+        allowed = {"open", "high", "low", "close", "volume", "amount", "vwap", "market_cap", "industry"}
+        fields = set(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", candidate.expression)) & allowed
+    return fields
+
+
+def _jaccard(left: set[str], right: set[str]) -> float:
+    if not left and not right:
+        return 1.0
+    union = left | right
+    return len(left & right) / len(union) if union else 0.0
+
+
+def _novelty_score(candidate: "FactorCandidate", accepted_candidates: list["FactorCandidate"]) -> float:
+    """Return 0..1 novelty versus accepted candidates; higher is more novel."""
+    if not accepted_candidates:
+        return 1.0
+
+    cand_struct = candidate.structure_signature or _structure_signature(
+        candidate.canonical_expression or candidate.expression
+    )
+    cand_ops = _expression_ops(candidate.canonical_expression or candidate.expression)
+    cand_fields = _candidate_fields(candidate)
+    max_similarity = 0.0
+
+    for other in accepted_candidates:
+        other_struct = other.structure_signature or _structure_signature(other.canonical_expression or other.expression)
+        other_ops = _expression_ops(other.canonical_expression or other.expression)
+        other_fields = _candidate_fields(other)
+        struct_sim = 1.0 if cand_struct and cand_struct == other_struct else 0.0
+        op_sim = _jaccard(cand_ops, other_ops)
+        field_sim = _jaccard(cand_fields, other_fields)
+        family_sim = 1.0 if (candidate.family or "unknown") == (other.family or "unknown") else 0.0
+        similarity = 0.35 * struct_sim + 0.25 * op_sim + 0.20 * field_sim + 0.20 * family_sim
+        max_similarity = max(max_similarity, similarity)
+
+    return max(0.0, min(1.0, 1.0 - max_similarity))
+
+
+def _niche_key(candidate: "FactorCandidate") -> tuple[str, str, str, str]:
+    family = candidate.family or "unknown"
+    windows = sorted(candidate.lookback_windows or [])
+    max_window = max(windows) if windows else 0
+    if max_window <= 0:
+        horizon = "static"
+    elif max_window <= 10:
+        horizon = "short"
+    elif max_window <= 40:
+        horizon = "medium"
+    else:
+        horizon = "long"
+    ops = sorted(_expression_ops(candidate.canonical_expression or candidate.expression))
+    op_bucket = "+".join(ops[:3]) if ops else "python"
+    fields = sorted(_candidate_fields(candidate))
+    field_bucket = "+".join(fields[:3]) if fields else "unknown"
+    return family, horizon, op_bucket, field_bucket
 
 
 def _notify(message: str) -> None:
@@ -428,6 +532,9 @@ Rules:
 - The expression must be a single DSL expression using only allowed fields/operators and +, -, *, /.
 - Use ts_return(close, n) for trailing returns.
 - Explain why the factor is economically different from prior survivors.
+- Novelty is mandatory: do not only change lookback windows.
+- Do not only add rank/zscore/winsorize/neutralize wrappers to an existing formula.
+- At least one of raw fields, operator composition, economic hypothesis, or interaction logic must differ from prior survivors.
 
 Required JSON schema:
 {{
@@ -439,7 +546,11 @@ Required JSON schema:
   "required_fields": ["close", "volume"],
   "lookback_windows": [5, 20],
   "risk_notes": ["..."],
-  "why_not_duplicate": "..."
+  "why_not_duplicate": "...",
+  "novelty_axis": "field_set | operator_composition | economic_mechanism | interaction_logic | neutralization",
+  "closest_existing_factor": "name or none",
+  "why_not_parameter_tweak": "why this is not merely a window/wrapper tweak",
+  "forbidden_similarity_check": "explicitly state no window-only or wrapper-only duplication"
 }}
 """
     if survivors:
@@ -448,6 +559,23 @@ Required JSON schema:
             detail = s.expression or s.economic_hypothesis or s.name
             base += f"- {s.name}: family={s.family}, sign={s.expected_sign}, expr={detail[:240]}\n"
     return base
+
+
+def _build_hypothesis_first_prompt(
+    description: str,
+    survivors: list[FactorCandidate],
+    factor_type_hint: str,
+    cfg: MiningConfig,
+) -> str:
+    prompt = _build_dsl_generation_prompt(description, survivors, factor_type_hint, cfg)
+    return (
+        prompt
+        + "\nHypothesis-first mode:\n"
+        + "- First internally invent a new tradable economic mechanism for A-shares.\n"
+        + "- Then encode that mechanism as the DSL JSON above.\n"
+        + "- The JSON economic_hypothesis must name the mechanism before the formula.\n"
+        + "- Output only the final JSON object, no prose outside JSON.\n"
+    )
 
 
 def _extract_json_object(text: str) -> dict:
@@ -480,6 +608,8 @@ Rules:
 - Do not invent or edit formulas.
 - Do not output Python code.
 - Choose exactly one recipe_id from the library above.
+- Avoid selecting a recipe whose structure only changes lookback windows from an existing survivor.
+- Avoid selections that only add/remove rank, zscore, winsorize, or neutralize wrappers.
 - Use why_not_duplicate to explain why this choice is not too similar to existing accepted factors.
 
 Required JSON schema:
@@ -603,14 +733,18 @@ def _evaluate_candidate(
     return candidate
 
 
-def _candidate_rank_key(c: FactorCandidate) -> tuple[int, float, float, float, int]:
+def _candidate_rank_key(c: FactorCandidate) -> tuple[int, float, float, float, float, float, float, int]:
     validation_bonus = abs(c.validation_rank_ic) if c.validation_rank_ic else 0.0
+    test_bonus = abs(c.test_rank_ic) if c.test_rank_ic else 0.0
     recent_bonus = abs(c.recent_rank_ic) if c.recent_rank_ic else 0.0
     return (
         GRADE_ORDER.get(c.grade, 0),
         validation_bonus,
+        test_bonus,
         recent_bonus,
+        c.novelty_score,
         abs(c.mean_rank_ic),
+        -(c.max_similarity or 0.0),
         -c.complexity_score,
     )
 
@@ -874,6 +1008,34 @@ class AlphaMiner:
         all_c = {c.name: c for c in self._candidates_from_state()}
         return [all_c[n] for n in self._state.survivors if n in all_c]
 
+    def _ensure_state_registries(self) -> None:
+        """Backfill dedup registries for old checkpoints and resumed runs."""
+        if not self._state:
+            return
+        for c in self._candidates_from_state():
+            expr = c.canonical_expression or c.expression
+            compact = re.sub(r"\s+", "", expr or "")
+            if compact and compact not in self._state.seen_expressions:
+                self._state.seen_expressions.append(compact)
+            struct = c.structure_signature or _structure_signature(expr)
+            if struct and struct not in self._state.seen_structures:
+                self._state.seen_structures.append(struct)
+
+    def _register_expression_structure(self, expr: str) -> tuple[str, str, bool]:
+        compact = re.sub(r"\s+", "", expr or "")
+        struct = _structure_signature(expr)
+        if compact and compact in self._state.seen_expressions:
+            log.info("Duplicate canonical expression — skipping pre-eval")
+            return compact, struct, False
+        if struct and struct in self._state.seen_structures:
+            log.info("Duplicate structure, only parameter changed — skipping pre-eval")
+            return compact, struct, False
+        if compact:
+            self._state.seen_expressions.append(compact)
+        if struct:
+            self._state.seen_structures.append(struct)
+        return compact, struct, True
+
     # ── Generation ────────────────────────────────────────────────────────
 
     def _generate_new_factors(
@@ -915,35 +1077,47 @@ class AlphaMiner:
 
         import itertools
         prompt_cycle = itertools.cycle(base_prompts)
+        diversity_modes = list(self.cfg.diversity_modes or ["recipe", "free_dsl", "crossover", "hypothesis_first"])
 
         for i in range(n):
             desc = next(prompt_cycle)
             ft_hint = factor_types[i % len(factor_types)]
+            diversity_mode = diversity_modes[i % len(diversity_modes)]
+            if diversity_mode == "recipe" and not self.cfg.use_prepared_recipes:
+                diversity_mode = "free_dsl"
+            if diversity_mode == "crossover" and len([s for s in survivors if s.expression]) < 2:
+                diversity_mode = "free_dsl"
             if self.cfg.generation_mode == "dsl":
-                if self.cfg.use_prepared_recipes:
+                if diversity_mode == "recipe":
                     user_msg = _build_recipe_selection_prompt(
                         desc,
                         survivors,
                         ft_hint,
                         recipes_for_prompt(ft_hint, limit=12),
                     )
+                elif diversity_mode == "hypothesis_first":
+                    user_msg = _build_hypothesis_first_prompt(desc, survivors, ft_hint, self.cfg)
+                elif diversity_mode == "crossover":
+                    user_msg = ""
                 else:
                     user_msg = _build_dsl_generation_prompt(desc, survivors, ft_hint, self.cfg)
             else:
                 user_msg = _build_generation_prompt(desc, survivors, ft_hint)
 
-            log.info("Generating factor %d/%d (gen %d)", i + 1, n, generation)
-            try:
-                raw = _call_llm_with_retry(user_msg, self.cfg.model, self.cfg)
-            except Exception as e:
-                log.error("LLM generation failed: %s", e)
-                continue
+            log.info("Generating factor %d/%d (gen %d, mode=%s)", i + 1, n, generation, diversity_mode)
+            raw = ""
+            if diversity_mode != "crossover" or self.cfg.generation_mode != "dsl":
+                try:
+                    raw = _call_llm_with_retry(user_msg, self.cfg.model, self.cfg)
+                except Exception as e:
+                    log.error("LLM generation failed: %s", e)
+                    continue
 
             spec = None
             validation = None
             if self.cfg.generation_mode == "dsl":
                 try:
-                    if self.cfg.use_prepared_recipes:
+                    if diversity_mode == "recipe":
                         selection = _extract_json_object(raw)
                         recipe = recipe_by_id(str(selection.get("recipe_id") or ""))
                         if recipe is None:
@@ -958,6 +1132,30 @@ class AlphaMiner:
                             name_suffix=_sanitize_name_suffix(str(selection.get("name_suffix") or "")),
                             economic_hypothesis=str(selection.get("economic_hypothesis") or ""),
                             why_not_duplicate=str(selection.get("why_not_duplicate") or ""),
+                        )
+                    elif diversity_mode == "crossover" and len([s for s in survivors if s.expression]) >= 2:
+                        live = [s for s in survivors if s.expression]
+                        left = live[i % len(live)]
+                        right = live[(i + 1) % len(live)]
+                        ops = ["+", "-", "*"]
+                        expr = f"rank(({left.expression}) {ops[i % len(ops)]} ({right.expression}))"
+                        struct = _structure_signature(expr)
+                        if struct and struct in self._state.seen_structures:
+                            log.info("Duplicate structure, only parameter changed — skipping pre-eval")
+                            continue
+                        spec = FactorSpec(
+                            name=f"crossover_{_sanitize_name_suffix(left.family)}_{_sanitize_name_suffix(right.family)}",
+                            family="composite",
+                            economic_hypothesis=(
+                                f"Composite interaction between {left.name} and {right.name}; "
+                                "tests whether two low-overlap signals reinforce each other."
+                            ),
+                            expression=expr,
+                            expected_sign="unknown",
+                            required_fields=sorted(set(left.required_fields + right.required_fields)),
+                            lookback_windows=sorted(set(left.lookback_windows + right.lookback_windows)),
+                            risk_notes=["Crossover composite may increase turnover and complexity."],
+                            why_not_duplicate=f"Crossover of {left.name} and {right.name}, not a parameter-only mutation.",
                         )
                     else:
                         spec = FactorSpec.from_json_text(raw)
@@ -984,11 +1182,11 @@ class AlphaMiner:
             # Pre-eval expression dedup: skip logically identical DSL formulas even
             # if the generated Python wrapper differs (e.g. different variable names).
             _compact_expr = ""
+            _structure = ""
             if spec is not None:
                 _raw_expr = (validation.canonical_expression if validation else None) or spec.expression
-                _compact_expr = re.sub(r"\s+", "", _raw_expr)
-                if _compact_expr and _compact_expr in self._state.seen_expressions:
-                    log.info("Duplicate canonical expression — skipping pre-eval")
+                _compact_expr, _structure, is_new_structure = self._register_expression_structure(_raw_expr)
+                if not is_new_structure:
                     continue
 
             base_name = spec.name if spec else "llm"
@@ -996,7 +1194,7 @@ class AlphaMiner:
             c = FactorCandidate(
                 name=name, code=code, code_hash=h,
                 generation=generation,
-                origin="recipe" if (spec and self.cfg.use_prepared_recipes) else ("dsl" if spec else "llm"),
+                origin=diversity_mode if spec else "llm",
                 family=spec.family if spec else ft_hint,
                 economic_hypothesis=spec.economic_hypothesis if spec else "",
                 expression=spec.expression if spec else "",
@@ -1007,19 +1205,21 @@ class AlphaMiner:
                 risk_notes=spec.risk_notes if spec else [],
                 why_not_duplicate=spec.why_not_duplicate if spec else "",
                 complexity_score=validation.complexity_score if validation else 0,
+                structure_signature=_structure,
             )
             self._state.seen_hashes.append(h)
-            if _compact_expr:
-                self._state.seen_expressions.append(_compact_expr)
             yield c
 
     def _mutate_survivors(
         self,
         survivors: list[FactorCandidate],
         generation: int,
+        mutation_budget: int | None = None,
     ) -> list[FactorCandidate]:
         """Generate mutations of survivors."""
         if not self.cfg.mutation_enabled or not survivors:
+            return []
+        if mutation_budget is not None and mutation_budget <= 0:
             return []
 
         from factor_dsl import DSLConfig, FactorSpec, compile_expression_to_module, validate_expression
@@ -1072,6 +1272,9 @@ class AlphaMiner:
                     except Exception as e:
                         log.debug("Could not compile DSL mutation %s: %s", vname, e)
                         continue
+                    _, structure, is_new_structure = self._register_expression_structure(validation.canonical_expression or expr)
+                    if not is_new_structure:
+                        continue
                     h = _code_hash(vcode)
                     if self.cfg.dedup_on_code_hash and h in self._state.seen_hashes:
                         continue
@@ -1092,9 +1295,13 @@ class AlphaMiner:
                         risk_notes=list(s.risk_notes),
                         why_not_duplicate=spec.why_not_duplicate,
                         complexity_score=validation.complexity_score,
+                        structure_signature=structure,
                     )
                     results.append(c)
                     self._state.seen_hashes.append(h)
+                    if mutation_budget is not None and len(results) >= mutation_budget:
+                        log.info("Mutation budget reached: %d", mutation_budget)
+                        return results
                 continue
 
             variants = mutator.generate_all(
@@ -1117,6 +1324,9 @@ class AlphaMiner:
                 )
                 results.append(c)
                 self._state.seen_hashes.append(h)
+                if mutation_budget is not None and len(results) >= mutation_budget:
+                    log.info("Mutation budget reached: %d", mutation_budget)
+                    return results
         log.info("Mutation produced %d new candidates from %d survivors", len(results), len(survivors))
         return results
 
@@ -1171,6 +1381,7 @@ class AlphaMiner:
         survivors: list[FactorCandidate],
         generation: int,
         n_llm: int,
+        mutation_budget: int,
     ) -> list[FactorCandidate]:
         """Generate and evaluate one generation through a bounded producer/consumer queue."""
         import threading
@@ -1220,19 +1431,15 @@ class AlphaMiner:
         pending = set()
         future_map: dict[Any, FactorCandidate] = {}
         with ThreadPoolExecutor(max_workers=n_parallel) as pool:
-            initial_candidates: list[FactorCandidate] = []
-            if self.cfg.mutation_enabled and survivors:
-                initial_candidates.extend(self._mutate_survivors(survivors, generation))
+            def _mutation_stream():
+                if self.cfg.mutation_enabled and survivors:
+                    yield from self._mutate_survivors(survivors, generation, mutation_budget)
 
-            candidate_stream = (
-                c for group in (
-                    iter(initial_candidates),
-                    self._iter_new_factors(survivors, generation, n_llm),
-                )
-                for c in group
-            )
+            def _candidate_stream():
+                yield from self._iter_new_factors(survivors, generation, n_llm)
+                yield from _mutation_stream()
 
-            for candidate in candidate_stream:
+            for candidate in _candidate_stream():
                 if _over_time():
                     log.warning("Max run hours (%.1f) reached — stopping queue submissions", self.cfg.max_run_hours)
                     stop_early.set()
@@ -1273,11 +1480,23 @@ class AlphaMiner:
     ) -> list[FactorCandidate]:
         """Reject duplicate variants by expression, factor values, family pressure, and IC series."""
         if not self.cfg.diversity_penalty:
+            accepted = [c for c in reference if c.passes(self.cfg)]
+            for c in candidates:
+                c.structure_signature = c.structure_signature or _structure_signature(c.canonical_expression or c.expression)
+                c.novelty_score = _novelty_score(c, accepted)
+                if not c.error and c.novelty_score < 0.25:
+                    c.diversity_rejected = True
+                    c.most_similar_to = "low_structural_novelty"
             return candidates
 
         candidates = sorted(candidates, key=_candidate_rank_key, reverse=True)
         accepted = [c for c in reference if c.passes(self.cfg)]
         accepted_expr = {re.sub(r"\s+", "", c.canonical_expression or c.expression) for c in accepted if c.expression}
+        accepted_structures = {
+            c.structure_signature or _structure_signature(c.canonical_expression or c.expression)
+            for c in accepted
+            if c.expression or c.structure_signature
+        }
         cache: dict[str, Any] = {}
 
         for c in candidates:
@@ -1285,11 +1504,25 @@ class AlphaMiner:
                 continue
 
             compact_expr = re.sub(r"\s+", "", c.canonical_expression or c.expression)
+            c.structure_signature = c.structure_signature or _structure_signature(c.canonical_expression or c.expression)
             if compact_expr and compact_expr in accepted_expr:
                 c.diversity_rejected = True
                 c.most_similar_to = "same_expression"
                 c.max_similarity = 1.0
                 log.info("Diversity reject %-40s duplicate DSL expression", c.name)
+                continue
+            if c.structure_signature and c.structure_signature in accepted_structures:
+                c.diversity_rejected = True
+                c.most_similar_to = "same_structure"
+                c.max_similarity = 1.0
+                log.info("Diversity reject %-40s duplicate DSL structure", c.name)
+                continue
+
+            c.novelty_score = _novelty_score(c, accepted)
+            if c.novelty_score < 0.25:
+                c.diversity_rejected = True
+                c.most_similar_to = "low_structural_novelty"
+                log.info("Diversity reject %-40s novelty_score=%.3f", c.name, c.novelty_score)
                 continue
 
             best_name = ""
@@ -1321,6 +1554,8 @@ class AlphaMiner:
                 accepted.append(c)
                 if compact_expr:
                     accepted_expr.add(compact_expr)
+                if c.structure_signature:
+                    accepted_structures.add(c.structure_signature)
 
         return candidates
 
@@ -1339,12 +1574,26 @@ class AlphaMiner:
 
         ranked = sorted(passing, key=_candidate_rank_key, reverse=True)
         selected: list[FactorCandidate] = []
+        selected_niches: set[tuple[str, str, str, str]] = set()
 
         def add(c: FactorCandidate | None) -> None:
             if c and c.name not in {s.name for s in selected} and len(selected) < self.cfg.top_k_survivors:
                 selected.append(c)
 
+        def add_niche(c: FactorCandidate | None) -> None:
+            if not c or len(selected) >= self.cfg.top_k_survivors or c.name in {s.name for s in selected}:
+                return
+            niche = _niche_key(c)
+            if niche in selected_niches:
+                return
+            selected_niches.add(niche)
+            selected.append(c)
+
         add(ranked[0])  # best overall
+        selected_niches.add(_niche_key(ranked[0]))
+
+        for c in ranked:
+            add_niche(c)
 
         best_by_family: dict[str, FactorCandidate] = {}
         for c in ranked:
@@ -1352,7 +1601,7 @@ class AlphaMiner:
             if fam not in best_by_family:
                 best_by_family[fam] = c
         for c in sorted(best_by_family.values(), key=_candidate_rank_key, reverse=True):
-            add(c)
+            add_niche(c)
 
         low_corr = sorted(
             passing,
@@ -1383,10 +1632,12 @@ class AlphaMiner:
         if resume:
             log.info("Resuming run: %s", self.run_id)
             self._state = self._load_checkpoint()
+            self._ensure_state_registries()
             start_gen = self._state.generations_done
             survivors = self._survivors_from_state()
         else:
             self._state = self._init_state()
+            self._ensure_state_registries()
             start_gen = 0
             survivors = []
             log.info("Starting new run: %s", self.run_id)
@@ -1405,14 +1656,25 @@ class AlphaMiner:
             log.info("GENERATION %d / %d", gen, self.cfg.n_generations - 1)
             log.info("=" * 60)
 
-            n_llm = max(1, self.cfg.factors_per_generation - len(survivors) * self.cfg.max_variants_per_factor)
+            n_llm = max(
+                self.cfg.min_llm_new_per_generation,
+                int(self.cfg.factors_per_generation * self.cfg.exploration_ratio),
+            )
+            n_llm = min(self.cfg.factors_per_generation, max(0, n_llm))
+            mutation_budget = max(0, self.cfg.factors_per_generation - n_llm)
+            if self.cfg.mutation_budget_ratio >= 0:
+                mutation_budget = min(
+                    mutation_budget,
+                    max(0, int(self.cfg.factors_per_generation * self.cfg.mutation_budget_ratio)),
+                )
+            log.info("Generation budget: n_llm=%d mutation_budget=%d", n_llm, mutation_budget)
             if self.cfg.pipeline_queue_enabled:
-                evaluated = self._run_generation_queue(survivors, gen, n_llm)
+                evaluated = self._run_generation_queue(survivors, gen, n_llm, mutation_budget)
             else:
                 # Generate, then evaluate as a batch. Kept for deterministic fallback/debugging.
                 new_candidates = self._generate_new_factors(survivors, gen, n_llm)
                 if self.cfg.mutation_enabled and survivors:
-                    new_candidates += self._mutate_survivors(survivors, gen)
+                    new_candidates += self._mutate_survivors(survivors, gen, mutation_budget)
 
                 if not new_candidates:
                     log.warning("Generation %d: no new candidates generated — skipping", gen)
@@ -1512,13 +1774,14 @@ class AlphaMiner:
             lines.append(f"| {family} | {count} |")
 
         lines += ["", "## Top Factors", "",
-                  "| Name | Family | Direction | Grade | Mean RIC | Val RIC | Test RIC | Recent RIC | Turnover | Max Corr | Rec |",
-                  "|------|--------|-----------|-------|----------|---------|----------|------------|----------|----------|-----|"]
+                  "| Name | Family | Direction | Grade | Mean RIC | Val RIC | Test RIC | Recent RIC | Novelty | Turnover | Max Corr | Rec |",
+                  "|------|--------|-----------|-------|----------|---------|----------|------------|---------|----------|----------|-----|"]
         for c in passing_sorted[:20]:
             lines.append(
                 f"| {c.name} | {c.family} | {c.alpha_direction} | {c.grade} | "
                 f"{c.mean_rank_ic:.4f} | {c.validation_rank_ic:.4f} | {c.test_rank_ic:.4f} | "
-                f"{c.recent_rank_ic:.4f} | {c.turnover_estimate:.3f} | {c.max_similarity:.3f} | {c.recommendation} |"
+                f"{c.recent_rank_ic:.4f} | {c.novelty_score:.3f} | {c.turnover_estimate:.3f} | "
+                f"{c.max_similarity:.3f} | {c.recommendation} |"
             )
 
         if unsafe:
@@ -1530,11 +1793,11 @@ class AlphaMiner:
 
         if diversity_rejected:
             lines += ["", "## Duplicate And Diversity Rejections", "",
-                      "| Name | Family | Value Corr | IC-Series Corr | Most Similar To |",
-                      "|------|--------|------------|----------------|-----------------|"]
+                      "| Name | Family | Novelty | Value Corr | IC-Series Corr | Most Similar To |",
+                      "|------|--------|---------|------------|----------------|-----------------|"]
             for c in sorted(diversity_rejected, key=lambda x: max(x.max_similarity, x.ic_series_max_similarity), reverse=True)[:30]:
                 lines.append(
-                    f"| {c.name} | {c.family} | {c.max_similarity:.3f} | "
+                    f"| {c.name} | {c.family} | {c.novelty_score:.3f} | {c.max_similarity:.3f} | "
                     f"{c.ic_series_max_similarity:.3f} | {c.most_similar_to} |"
                 )
 
@@ -1566,8 +1829,8 @@ class AlphaMiner:
                           "rank_ic_win_rate", "ic_t_stat", "valid_days", "coverage",
                           "avg_cross_sectional_coverage", "factor_autocorr", "turnover_estimate",
                           "recent_rank_ic", "train_rank_ic", "validation_rank_ic", "test_rank_ic",
-                          "max_similarity", "ic_series_max_similarity", "complexity_score",
-                          "recommendation", "expression", "ic_csv_path"]
+                          "max_similarity", "ic_series_max_similarity", "novelty_score",
+                          "structure_signature", "complexity_score", "recommendation", "expression", "ic_csv_path"]
                 w = _csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
                 w.writeheader()
                 w.writerows(asdict(c) for c in passing_sorted[:50])

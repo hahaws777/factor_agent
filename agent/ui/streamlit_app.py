@@ -660,7 +660,7 @@ def _render_order_lane(title: str, tickets: list[str]) -> str:
     return f"<div class='order-lane'><h4>{_html_escape(title)}</h4>{body}</div>"
 
 
-def _render_kitchen_pipeline_board(run_dir: Path, config: dict, candidates_df=None) -> None:
+def _render_calculation_pipeline_board(run_dir: Path, config: dict, candidates_df=None) -> None:
     st.markdown("**Alpha mining calculation board**")
 
     q_enabled = bool(config.get("pipeline_queue_enabled", True))
@@ -769,7 +769,7 @@ def _render_mining_run(run_dir: Path) -> None:
     cp = run_dir / "checkpoint.json"
     if not cp.is_file():
         st.warning("Checkpoint not found yet. If the run just started, this is normal until the first generation finishes.")
-        _render_kitchen_pipeline_board(run_dir, config={}, candidates_df=None)
+        _render_calculation_pipeline_board(run_dir, config={}, candidates_df=None)
         _render_factor_artifacts(run_dir)
         _render_backtest_artifacts(run_dir, title="Run-level decile backtest results")
         _render_run_jobs(run_dir.name)
@@ -796,7 +796,7 @@ def _render_mining_run(run_dir: Path) -> None:
     col3.metric("Best mean Rank IC", f"{state.get('best_mean_ric', 0):.4f}")
     col4.metric("Total evaluated", len(candidates))
 
-    _render_kitchen_pipeline_board(run_dir, config, candidates_df=df)
+    _render_calculation_pipeline_board(run_dir, config, candidates_df=df)
 
     if not df.empty:
         _render_factor_artifacts(run_dir, candidates_df=df)

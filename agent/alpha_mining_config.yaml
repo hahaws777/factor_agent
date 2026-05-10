@@ -9,6 +9,9 @@ mining:
   min_rank_ic: 0.015        # hard floor: factors below this are always dropped
   diversity_penalty: true   # penalise factors too similar to existing survivors
   diversity_corr_threshold: 0.90
+  exploration_ratio: 0.6    # share of each generation reserved for fresh LLM ideas
+  min_llm_new_per_generation: 4
+  mutation_budget_ratio: 0.4
 
 generation:
   mode: "dsl"               # dsl (safe JSON expression) or python (legacy full module)
@@ -17,6 +20,7 @@ generation:
   max_expression_nodes: 80
   max_lookback_window: 252
   use_prepared_recipes: true  # LLM chooses from prepared DSL formula recipes instead of inventing common formulas
+  diversity_modes: [recipe, free_dsl, crossover, hypothesis_first]
   seed_prompts:             # Round-0 starting prompts (overridden by survivors in later rounds)
     - "20-day price momentum: past 20-day return, cross-sectionally ranked"
     - "short-term reversal: negative 5-day return, winsorized 1-99%"
