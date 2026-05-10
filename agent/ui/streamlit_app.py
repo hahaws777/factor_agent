@@ -129,22 +129,22 @@ def _inject_theme_css():
         .order-ticket.cancelled { border-left-color: #9aa0aa; }
         .ticket-title { font-weight: 650; color: #f4f4f8; font-size: 0.9rem; }
         .ticket-meta { color: #a8adbd; font-size: 0.78rem; margin-top: 3px; overflow-wrap: anywhere; }
-        .kitchen-grid {
+        .pipeline-grid {
             display: grid;
             grid-template-columns: repeat(4, minmax(0, 1fr));
             gap: 10px;
             margin: 8px 0 12px 0;
         }
-        .kitchen-cell {
+        .pipeline-cell {
             border: 1px solid #303241;
             background: #161820;
             border-radius: 8px;
             padding: 10px;
         }
-        .kitchen-label { color: #9ca3b5; font-size: 0.78rem; }
-        .kitchen-value { color: #f2f3f7; font-size: 1.08rem; font-weight: 700; margin-top: 3px; }
+        .pipeline-label { color: #9ca3b5; font-size: 0.78rem; }
+        .pipeline-value { color: #f2f3f7; font-size: 1.08rem; font-weight: 700; margin-top: 3px; }
         @media (max-width: 900px) {
-            .order-board, .kitchen-grid { grid-template-columns: 1fr; }
+            .order-board, .pipeline-grid { grid-template-columns: 1fr; }
         }
         </style>
         """,
@@ -639,7 +639,7 @@ def _factor_station(row: dict) -> tuple[str, str]:
     if has_ic:
         return "Completed IC", "success"
     if has_pkl:
-        return "Factor cooked", "running"
+        return "Factor calculated", "running"
     if has_py:
         return "Formula ticketed", "pending"
     return "Waiting", "pending"
@@ -661,7 +661,7 @@ def _render_order_lane(title: str, tickets: list[str]) -> str:
 
 
 def _render_kitchen_pipeline_board(run_dir: Path, config: dict, candidates_df=None) -> None:
-    st.markdown("**Alpha mining order board**")
+    st.markdown("**Alpha mining calculation board**")
 
     q_enabled = bool(config.get("pipeline_queue_enabled", True))
     outer_workers = int(config.get("outer_workers", 1) or 1)
@@ -676,30 +676,30 @@ def _render_kitchen_pipeline_board(run_dir: Path, config: dict, candidates_df=No
     bad_jobs = [j for j in jobs if j.get("status") in {"failed", "cancelled"}]
 
     accepted = sum(1 for r in factor_rows if r.get("ic_csv"))
-    cooking = sum(1 for r in factor_rows if r.get("pkl") and not r.get("ic_csv"))
+    calculating = sum(1 for r in factor_rows if r.get("pkl") and not r.get("ic_csv"))
     ticketed = sum(1 for r in factor_rows if r.get("py") and not r.get("pkl"))
     errored = len(bad_jobs)
 
     st.markdown(
         f"""
-        <div class="kitchen-grid">
-          <div class="kitchen-cell"><div class="kitchen-label">Front counter</div><div class="kitchen-value">LLM + recipe picker</div></div>
-          <div class="kitchen-cell"><div class="kitchen-label">Order queue</div><div class="kitchen-value">{'On' if q_enabled else 'Off'} · cap {queue_size}</div></div>
-          <div class="kitchen-cell"><div class="kitchen-label">Kitchen stations</div><div class="kitchen-value">{outer_workers} consumers</div></div>
-          <div class="kitchen-cell"><div class="kitchen-label">IC line cooks</div><div class="kitchen-value">{eval_workers} workers / factor</div></div>
+        <div class="pipeline-grid">
+          <div class="pipeline-cell"><div class="pipeline-label">Producer</div><div class="pipeline-value">LLM + recipe picker</div></div>
+          <div class="pipeline-cell"><div class="pipeline-label">Task queue</div><div class="pipeline-value">{'On' if q_enabled else 'Off'} · cap {queue_size}</div></div>
+          <div class="pipeline-cell"><div class="pipeline-label">Consumers</div><div class="pipeline-value">{outer_workers} workers</div></div>
+          <div class="pipeline-cell"><div class="pipeline-label">IC calculators</div><div class="pipeline-value">{eval_workers} workers / factor</div></div>
         </div>
-        <div class="kitchen-grid">
-          <div class="kitchen-cell"><div class="kitchen-label">Formula tickets</div><div class="kitchen-value">{len(factor_rows)}</div></div>
-          <div class="kitchen-cell"><div class="kitchen-label">Cooking</div><div class="kitchen-value">{cooking + ticketed}</div></div>
-          <div class="kitchen-cell"><div class="kitchen-label">Served IC</div><div class="kitchen-value">{accepted}</div></div>
-          <div class="kitchen-cell"><div class="kitchen-label">Problems</div><div class="kitchen-value">{errored}</div></div>
+        <div class="pipeline-grid">
+          <div class="pipeline-cell"><div class="pipeline-label">Formula tasks</div><div class="pipeline-value">{len(factor_rows)}</div></div>
+          <div class="pipeline-cell"><div class="pipeline-label">Calculating</div><div class="pipeline-value">{calculating + ticketed}</div></div>
+          <div class="pipeline-cell"><div class="pipeline-label">Completed IC</div><div class="pipeline-value">{accepted}</div></div>
+          <div class="pipeline-cell"><div class="pipeline-label">Attention</div><div class="pipeline-value">{errored}</div></div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
     lanes = {
-        "1. New Orders": [
+        "1. Queued": [
             _render_order_ticket(
                 f"Job {j.get('id')} · {j.get('job_type')}",
                 str(j.get("status") or "pending"),
@@ -707,7 +707,7 @@ def _render_kitchen_pipeline_board(run_dir: Path, config: dict, candidates_df=No
             )
             for j in pending_jobs[:5]
         ],
-        "2. In Kitchen": [
+        "2. Calculating": [
             _render_order_ticket(
                 f"Job {j.get('id')} · {j.get('job_type')}",
                 str(j.get("status") or "running"),
@@ -715,7 +715,7 @@ def _render_kitchen_pipeline_board(run_dir: Path, config: dict, candidates_df=No
             )
             for j in running_jobs[:5]
         ],
-        "3. Served": [
+        "3. Completed": [
             _render_order_ticket(
                 str(r.get("factor") or ""),
                 _factor_station(r)[1],
@@ -727,7 +727,7 @@ def _render_kitchen_pipeline_board(run_dir: Path, config: dict, candidates_df=No
             )
             for r in [x for x in factor_rows if x.get("ic_csv")][:5]
         ],
-        "4. Needs Attention": [
+        "4. Attention": [
             _render_order_ticket(
                 f"Job {j.get('id')} · {j.get('job_type')}",
                 str(j.get("status") or "failed"),
@@ -744,7 +744,7 @@ def _render_kitchen_pipeline_board(run_dir: Path, config: dict, candidates_df=No
     )
 
     if factor_rows:
-        with st.expander("Factor order tickets", expanded=True):
+        with st.expander("Factor calculation tasks", expanded=True):
             import pandas as pd
 
             ticket_df = pd.DataFrame([
