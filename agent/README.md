@@ -61,10 +61,14 @@ evaluation:
   validation_start: ""
   test_start: ""
   recent_start: ""
+  pipeline_queue_enabled: true
+  pipeline_queue_size: 0
   compute_trade_metrics: false
 ```
 
 Unsafe or duplicate candidates are retained in the ledger/report with rejection reasons instead of being silently discarded.
+
+Queue mode submits each candidate to the evaluation pool as soon as it is generated, so LLM generation and `factor_agent_pipeline.py` evaluation can overlap within the same generation. Set `pipeline_queue_enabled: false` to restore the old generate-then-evaluate batch flow.
 
 ## Chat UI (local)
 

@@ -298,6 +298,20 @@ python agent/alpha_miner.py start --provider anthropic --model claude-sonnet-4-6
 python agent/alpha_miner.py start --outer-workers 3 --generations 5 --per-gen 8
 ```
 
+### Queue Pipeline Mode
+
+The miner can overlap LLM generation with factor evaluation inside each generation:
+
+```yaml
+evaluation:
+  pipeline_queue_enabled: true
+  pipeline_queue_size: 0   # 0 = auto, max(2, 2 * outer_workers)
+```
+
+With queue mode on, a candidate is submitted to the evaluation pool as soon as it is generated. The LLM can continue producing later candidates while earlier candidates are already running through `factor_agent_pipeline.py`. This preserves the generation-level checkpoint/report flow, but reduces idle time when LLM calls and factor evaluations are both slow.
+
+Set `pipeline_queue_enabled: false` to use the old deterministic batch path: generate all candidates first, then evaluate them as a batch.
+
 ### Running the Alpha Miner
 
 ```bash

@@ -50,6 +50,8 @@ evaluation:
   exclude_limit_down: true
   exclude_suspended: true
   timeout_sec: 180        # kill a factor evaluation after this many seconds
+  pipeline_queue_enabled: true  # overlap LLM generation and factor evaluation inside each generation
+  pipeline_queue_size: 0        # 0 = auto (2 * outer_workers, min 2)
   ic_similarity_threshold: 0.90
   diversity_min_overlap: 10000
   diversity_sample_size: 300000

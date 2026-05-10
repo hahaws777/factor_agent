@@ -33,6 +33,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -95,6 +96,8 @@ class MiningConfig:
     eval_workers: int = 2       # level-2: IC workers per factor evaluation
     next_day_return: bool = True
     timeout_sec: int = 180
+    pipeline_queue_enabled: bool = True
+    pipeline_queue_size: int = 0
     ic_similarity_threshold: float = 0.90
     diversity_min_overlap: int = 10000
     diversity_sample_size: int = 300000
@@ -168,6 +171,8 @@ class MiningConfig:
         cfg.eval_workers = ev.get("workers", cfg.eval_workers)
         cfg.next_day_return = ev.get("next_day_return", cfg.next_day_return)
         cfg.timeout_sec = ev.get("timeout_sec", cfg.timeout_sec)
+        cfg.pipeline_queue_enabled = ev.get("pipeline_queue_enabled", cfg.pipeline_queue_enabled)
+        cfg.pipeline_queue_size = ev.get("pipeline_queue_size", cfg.pipeline_queue_size)
         cfg.ic_similarity_threshold = ev.get("ic_similarity_threshold", cfg.ic_similarity_threshold)
         cfg.diversity_min_overlap = ev.get("diversity_min_overlap", cfg.diversity_min_overlap)
         cfg.diversity_sample_size = ev.get("diversity_sample_size", cfg.diversity_sample_size)
@@ -822,10 +827,18 @@ class AlphaMiner:
         n: int,
     ) -> list[FactorCandidate]:
         """Generate n new factor candidates via LLM."""
+        return list(self._iter_new_factors(survivors, generation, n))
+
+    def _iter_new_factors(
+        self,
+        survivors: list[FactorCandidate],
+        generation: int,
+        n: int,
+    ):
+        """Yield generated candidates one by one so evaluation can overlap LLM calls."""
         from factor_code_agent import extract_python_code, validate_python_syntax
         from factor_dsl import DSLConfig, FactorSpec, compile_expression_to_module, validate_expression
 
-        candidates = []
         factor_types = self.cfg.extra_factor_types
         dsl_cfg = DSLConfig(
             allowed_fields=set(self.cfg.allowed_fields),
@@ -903,10 +916,8 @@ class AlphaMiner:
                 why_not_duplicate=spec.why_not_duplicate if spec else "",
                 complexity_score=validation.complexity_score if validation else 0,
             )
-            candidates.append(c)
             self._state.seen_hashes.append(h)
-
-        return candidates
+            yield c
 
     def _mutate_survivors(
         self,
@@ -1061,6 +1072,106 @@ class AlphaMiner:
 
         return results
 
+    def _run_generation_queue(
+        self,
+        survivors: list[FactorCandidate],
+        generation: int,
+        n_llm: int,
+    ) -> list[FactorCandidate]:
+        """Generate and evaluate one generation through a bounded producer/consumer queue."""
+        import threading
+        from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+        n_parallel = max(1, self.cfg.outer_workers)
+        queue_size = self.cfg.pipeline_queue_size or max(2, n_parallel * 2)
+        queue_size = max(1, queue_size)
+        results: list[FactorCandidate] = []
+        ledger_lock = threading.Lock()
+        stop_early = threading.Event()
+        submitted = 0
+
+        def _run_one(i: int, c: FactorCandidate) -> FactorCandidate:
+            if stop_early.is_set():
+                c.error = "cancelled: wall-clock limit"
+                return c
+            log.info("Queue evaluating %d: %s", i + 1, c.name)
+            return _evaluate_candidate(c, self.run_dir, self.cfg)
+
+        def _collect_done(done) -> None:
+            nonlocal results
+            for future in done:
+                candidate = future_map.pop(future, None)
+                try:
+                    result = future.result()
+                except Exception as e:
+                    if candidate is None:
+                        log.exception("Queued evaluation failed before candidate metadata was available")
+                        continue
+                    candidate.error = f"queued evaluation error: {e}"
+                    candidate.evaluated_at = datetime.utcnow().isoformat()
+                    log.exception("Queued evaluation failed for %s", candidate.name)
+                    result = candidate
+                results.append(result)
+                with ledger_lock:
+                    _append_ledger(result, self.ledger_path)
+
+        def _over_time() -> bool:
+            return (time.time() - self.start_wall) / 3600 > self.cfg.max_run_hours
+
+        log.info(
+            "Queue pipeline enabled: %d eval workers, queue_size=%d",
+            n_parallel,
+            queue_size,
+        )
+        pending = set()
+        future_map: dict[Any, FactorCandidate] = {}
+        with ThreadPoolExecutor(max_workers=n_parallel) as pool:
+            initial_candidates: list[FactorCandidate] = []
+            if self.cfg.mutation_enabled and survivors:
+                initial_candidates.extend(self._mutate_survivors(survivors, generation))
+
+            candidate_stream = (
+                c for group in (
+                    iter(initial_candidates),
+                    self._iter_new_factors(survivors, generation, n_llm),
+                )
+                for c in group
+            )
+
+            for candidate in candidate_stream:
+                if _over_time():
+                    log.warning("Max run hours (%.1f) reached — stopping queue submissions", self.cfg.max_run_hours)
+                    stop_early.set()
+                    break
+
+                while len(pending) >= queue_size:
+                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    _collect_done(done)
+                    if _over_time():
+                        log.warning("Max run hours (%.1f) reached — stopping queue submissions", self.cfg.max_run_hours)
+                        stop_early.set()
+                        break
+                if stop_early.is_set():
+                    break
+
+                future = pool.submit(_run_one, submitted, candidate)
+                pending.add(future)
+                future_map[future] = candidate
+                submitted += 1
+
+            while pending:
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                _collect_done(done)
+                if _over_time():
+                    log.warning("Max run hours (%.1f) reached — cancelling queued evaluations", self.cfg.max_run_hours)
+                    stop_early.set()
+                    for future in pending:
+                        future.cancel()
+                    break
+
+        log.info("Queue pipeline complete: %d submitted, %d finished", submitted, len(results))
+        return results
+
     def _apply_diversity_filter(
         self,
         candidates: list[FactorCandidate],
@@ -1200,21 +1311,27 @@ class AlphaMiner:
             log.info("GENERATION %d / %d", gen, self.cfg.n_generations - 1)
             log.info("=" * 60)
 
-            # Generate
             n_llm = max(1, self.cfg.factors_per_generation - len(survivors) * self.cfg.max_variants_per_factor)
-            new_candidates = self._generate_new_factors(survivors, gen, n_llm)
-            if self.cfg.mutation_enabled and survivors:
-                new_candidates += self._mutate_survivors(survivors, gen)
+            if self.cfg.pipeline_queue_enabled:
+                evaluated = self._run_generation_queue(survivors, gen, n_llm)
+            else:
+                # Generate, then evaluate as a batch. Kept for deterministic fallback/debugging.
+                new_candidates = self._generate_new_factors(survivors, gen, n_llm)
+                if self.cfg.mutation_enabled and survivors:
+                    new_candidates += self._mutate_survivors(survivors, gen)
 
-            if not new_candidates:
-                log.warning("Generation %d: no new candidates generated — skipping", gen)
+                if not new_candidates:
+                    log.warning("Generation %d: no new candidates generated — skipping", gen)
+                    self._state.generations_done = gen + 1
+                    continue
+
+                log.info("Generation %d: %d candidates to evaluate", gen, len(new_candidates))
+                evaluated = self._evaluate_batch(new_candidates)
+
+            if not evaluated:
+                log.warning("Generation %d: no candidates evaluated — skipping", gen)
                 self._state.generations_done = gen + 1
                 continue
-
-            log.info("Generation %d: %d candidates to evaluate", gen, len(new_candidates))
-
-            # Evaluate
-            evaluated = self._evaluate_batch(new_candidates)
             evaluated = self._apply_diversity_filter(evaluated, self._candidates_from_state())
 
             # Update state

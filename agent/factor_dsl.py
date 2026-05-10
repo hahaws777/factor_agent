@@ -264,7 +264,7 @@ def compute_factor_df() -> pd.DataFrame:
     { _field_assignments(validation.required_fields) }
     factor = {expr}
     factor = factor.astype(float)
-    out = factor.stack(dropna=False).rename("{name}").to_frame()
+    out = factor.stack(dropna=True).rename("{name}").to_frame()
     out.index.names = ["date", "order_book_id"]
     out = out.reorder_levels(["order_book_id", "date"]).sort_index()
     return out
