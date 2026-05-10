@@ -89,6 +89,64 @@ def _rename_factor(code: str, old_name: str, new_name: str) -> str:
     return code.replace(f'"{old_name}"', f'"{new_name}"').replace(f"'{old_name}'", f"'{new_name}'")
 
 
+def mutate_dsl_expression(
+    expression: str,
+    windows: list[int] | None = None,
+    transforms: list[str] | None = None,
+    include_sign_flip: bool = False,
+) -> list[tuple[str, str]]:
+    """Generate simple safe DSL mutations without executing arbitrary Python."""
+    windows = windows or [5, 10, 20, 40, 60, 120]
+    transforms = transforms or ["rank", "zscore", "winsorize", "ts_rank"]
+    variants: list[tuple[str, str]] = []
+
+    detected = _detect_windows(expression)
+    if detected:
+        primary = detected[0]
+        for window in windows:
+            if window != primary:
+                variants.append((f"window_{window}", _replace_window(expression, primary, window)))
+
+    for transform in transforms:
+        if transform == "ts_rank":
+            variants.append(("transform_ts_rank", f"ts_rank({expression}, 20)"))
+        elif transform == "winsorize":
+            variants.append(("transform_winsorize", f"winsorize({expression})"))
+        else:
+            variants.append((f"transform_{transform}", f"{transform}({expression})"))
+
+    operator_pairs = [
+        ("ts_mean", "ts_rank"),
+        ("ts_rank", "ts_mean"),
+        ("delta", "ts_return"),
+        ("ts_return", "delta"),
+        ("ts_std", "ts_zscore"),
+        ("ts_zscore", "ts_std"),
+    ]
+    for old, new in operator_pairs:
+        if re.search(rf"\b{old}\s*\(", expression):
+            variants.append((f"operator_{old}_to_{new}", re.sub(rf"\b{old}\s*\(", f"{new}(", expression, count=1)))
+
+    if include_sign_flip:
+        variants.append(("sign_flip", f"-({expression})"))
+
+    if "neutralize_industry(" not in expression:
+        variants.append(("neutralize_industry", f"neutralize_industry({expression})"))
+    if "neutralize_size(" not in expression:
+        variants.append(("neutralize_size", f"neutralize_size({expression})"))
+    if "neutralize_industry(" not in expression and "neutralize_size(" not in expression:
+        variants.append(("neutralize_industry_size", f"neutralize_size(neutralize_industry({expression}))"))
+
+    seen: set[str] = set()
+    unique: list[tuple[str, str]] = []
+    for name, expr in variants:
+        compact = re.sub(r"\s+", "", expr)
+        if compact not in seen:
+            seen.add(compact)
+            unique.append((name, expr))
+    return unique
+
+
 # ── Main mutation class ───────────────────────────────────────────────────────
 
 class FactorMutator:

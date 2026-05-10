@@ -120,7 +120,9 @@ Core workflows write `run_metadata.json` automatically:
 
 ## Alpha Mining Agent Architecture
 
-An **evolutionary factor discovery loop** driven by an LLM, with full harness engineering (checkpointing, deduplication, Telegram alerts, run ledger).
+An **evolutionary factor discovery loop** driven by an LLM, with safer constrained factor generation and full harness engineering (checkpointing, deduplication, Telegram alerts, run ledger).
+
+By default, `alpha_miner.py` no longer asks the LLM to write arbitrary Python factor modules. It asks for a structured JSON factor spec, validates the contained DSL expression, compiles it internally into vectorized pandas code, runs a static safety validator, then evaluates the factor through the existing Rank IC pipeline. Legacy full-Python generation is still available with `generation.mode: "python"`.
 
 ### Top-Level Flow
 
@@ -137,17 +139,18 @@ alpha_mining_config.yaml
 │  ║  ┌─────────────┐     ┌────────────────────┐     ┌─────────────────┐  ║  │
 │  ║  │  GENERATE   │     │     EVALUATE        │     │     SELECT      │  ║  │
 │  ║  │             │     │                    │     │                 │  ║  │
-│  ║  │ LLM prompt  │────▶│ factor_agent_      │────▶│ factor_screener │  ║  │
-│  ║  │ (few-shot   │     │ pipeline.py        │     │ grade: A–F      │  ║  │
-│  ║  │  survivors) │     │ compute + rank IC  │     │ diversity pen.  │  ║  │
+│  ║  │ LLM JSON    │────▶│ DSL compile +      │────▶│ factor_agent_   │  ║  │
+│  ║  │ spec        │     │ safety validate    │     │ pipeline.py     │  ║  │
+│  ║  │ (few-shot   │     │ factor_dsl.py      │     │ compute + IC    │  ║  │
+│  ║  │  survivors) │     │ factor_safety.py   │     │ metrics         │  ║  │
 │  ║  └─────────────┘     └────────────────────┘     └────────┬────────┘  ║  │
-│  ║         ▲  LLM                                    top-k   │           ║  │
-│  ║         │  few-shot                             survivors │           ║  │
+│  ║         ▲  LLM                                  family-   │           ║  │
+│  ║         │  few-shot                             aware     │           ║  │
+│  ║         │                                      survivors  │           ║  │
 │  ║  ┌──────┴──────┐ ◀──────────────────────────────────────┘            ║  │
 │  ║  │   MUTATE    │                                                      ║  │
-│  ║  │ window_sweep│  factor_mutator.py                                   ║  │
-│  ║  │ add_transform│  (winsorize / rank / zscore)                        ║  │
-│  ║  │ llm_refine  │                                                      ║  │
+│  ║  │ DSL mutate  │  window / transform / operator / neutralize / sign    ║  │
+│  ║  │ legacy mut. │  legacy Python mutation remains available             ║  │
 │  ║  └─────────────┘                                                      ║  │
 │  ╚═══════════════════════════════════════════════════════════════════════╝  │
 │                                                                             │
@@ -155,6 +158,8 @@ alpha_mining_config.yaml
 │  ├── checkpoint.json        resume interrupted runs                         │
 │  ├── factor_ledger.csv      all-time log of every factor evaluated          │
 │  ├── MD5 dedup              never re-evaluate identical code                │
+│  ├── expression dedup       reject duplicate DSL expressions                │
+│  ├── factor/IC correlation  reject duplicated realised factors / IC series  │
 │  ├── Telegram notify        progress messages after each generation         │
 │  └── max_run_hours          safety wall-clock limit                         │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -163,22 +168,111 @@ alpha_mining_config.yaml
 ### Module Breakdown
 
 ```
-GENERATE                          EVALUATE                         SCREEN / ANALYSE
+GENERATE / CONSTRAIN              EVALUATE                         SCREEN / ANALYSE
 ─────────────────────             ────────────────────────         ───────────────────────────
 factor_code_agent.py              factor_agent_pipeline.py         factor_screener.py
- call_llm()             Python     compute_factor_df()     .pkl     grade_metrics()
+ call_llm()             JSON       compute_factor_df()     .pkl     grade_metrics()
   ├─ call_openai()     ─────────▶  ensure_multiindex()   ────────▶ screen_ic_csv()
-  └─ _call_anthropic()  code       save .pkl                        grade: A / B / C / D / F
- extract_python_code()                   │
- validate_python_syntax()                │ .pkl + data.pkl          ic_decay_analysis.py
-                                         ▼                           compute_decay([1,5,10,20])
-factor_mutator.py             factor_rankic_analysis.py             half-life, peak IC, PNG
- window_sweep()                FactorRankICAnalyzer
- add_transform()                .load_market_data()                factor_neutralizer.py
- llm_refine()                   .calculate_rank_ic()                cross_demean
-                                 Rank IC / IC IR / win rate          mktcap OLS residual
-                                                                     industry group mean
+  └─ _call_anthropic()  spec       save .pkl                        grade: A / B / C / D / F
+
+factor_dsl.py                     factor_rankic_analysis.py         alpha_miner.py
+ FactorSpec.from_json_text()       FactorRankICAnalyzer              walk-forward IC windows
+ validate_expression()             .load_market_data()               recent IC / IC t-stat
+ compile_expression_to_module()    .calculate_rank_ic()              coverage / autocorr / turnover
+ safe pandas vectorization          Rank IC / IC IR / win rate        inverse-alpha labeling
+
+factor_safety.py                  factor_mutator.py                 diversity gates
+ validate_factor_code()            mutate_dsl_expression()           expression duplicate
+ reject lookahead / leakage         window / transform / operator     factor-value correlation
+ reject external APIs / eval        neutralization / sign flip        IC-series correlation
+
+factor_neutralizer.py
+ cross_demean
+ mktcap OLS residual
+ industry group mean
 ```
+
+### Safe DSL Generation
+
+Default miner generation mode:
+
+```yaml
+generation:
+  mode: "dsl"
+  allowed_fields: [open, high, low, close, volume, amount, vwap, market_cap, industry]
+  max_expression_depth: 8
+  max_expression_nodes: 80
+  max_lookback_window: 252
+```
+
+The LLM must return JSON like:
+
+```json
+{
+  "name": "ranked_20d_momentum",
+  "family": "momentum",
+  "economic_hypothesis": "Stocks with stronger trailing returns may continue to outperform.",
+  "expression": "rank(ts_return(close, 20))",
+  "expected_sign": "positive",
+  "required_fields": ["close"],
+  "lookback_windows": [20],
+  "risk_notes": ["May crowd into momentum regimes."],
+  "why_not_duplicate": "Uses trailing return only, not volatility or volume divergence."
+}
+```
+
+Allowed DSL operators include `delay`, `delta`, `ts_return`, `ts_mean`, `ts_std`, `ts_rank`, `ts_zscore`, `ts_corr`, `rank`, `zscore`, `winsorize`, `signed_power`, `log1p_abs`, `neutralize_industry`, and `neutralize_size`. The compiler rejects unknown fields, unknown operators, future access, oversized windows, deep expressions, attribute access, subscript access, and arbitrary Python execution.
+
+### Safety And Robustness Gates
+
+Before any candidate is evaluated, `factor_safety.validate_factor_code()` checks the generated module. Rejected candidates are written to the run ledger with `error="rejected by safety validator: ..."` and are not run through the pipeline.
+
+The validator rejects or flags common alpha-mining hazards:
+
+- Negative shifts such as `shift(-1)`, future labels, `target`, `label`, `y`, `next_return`, `forward_return`
+- Future index access patterns, centered rolling windows, unsafe expanding-window usage
+- External data/API access (`rqdatac`, `yfinance`, `requests`, `akshare`, `tushare`, `urllib`)
+- `eval`, `exec`, subprocesses, shell calls, or file writes inside `compute_factor_df()`
+- Obvious non-DataFrame returns and suspicious nested loops
+
+After Rank IC evaluation, the miner adds incremental robustness metrics while preserving the old fields: IC t-stat, coverage, average cross-sectional coverage, factor autocorrelation, turnover estimate, recent-period IC, train/validation/test IC windows, by-year IC, factor-value correlation, IC-series correlation, complexity score, alpha direction (`positive_alpha` vs `inverse_alpha`), and a `keep / investigate / reject` recommendation. Optional long-short, cost-adjusted return, and drawdown estimates can be enabled with:
+
+```yaml
+evaluation:
+  compute_trade_metrics: true
+  transaction_cost_bps: 10.0
+```
+
+This option reads `data.pkl` again per factor, so it is disabled by default for speed.
+
+### Walk-Forward Validation
+
+Use date windows to avoid accepting factors that only work in the full sample:
+
+```yaml
+evaluation:
+  train_start: "2010-01-01"
+  train_end: "2018-12-31"
+  validation_start: "2019-01-01"
+  validation_end: "2022-12-31"
+  test_start: "2023-01-01"
+  test_end: ""
+  recent_start: "2024-01-01"
+  recent_end: ""
+```
+
+`passes()` now requires the old grade/Rank IC gates plus basic validation/test stability when those windows are configured. Strong negative IC is explicitly labeled as `inverse_alpha` rather than being silently treated the same as positive alpha.
+
+### Diversity And Survivor Selection
+
+The miner now uses multiple duplication checks:
+
+- Code hash deduplication
+- DSL canonical-expression deduplication
+- Realized factor-value Spearman correlation
+- Daily IC-series correlation
+
+Survivor selection is family-aware. It keeps the best overall factor, best factors from different families, a low-correlation factor, a strong recent-period factor, and one exploratory candidate when available. This prevents every survivor from collapsing into the same momentum/reversal variant after a few generations.
 
 ### LLM Providers
 
@@ -248,8 +342,10 @@ E:/data/
 ├── agent/
 │   ├── alpha_miner.py            main evolutionary loop + harness
 │   ├── alpha_mining_config.yaml  all tuning parameters (provider, outer_workers, ...)
-│   ├── factor_code_agent.py      LLM code generation (OpenAI + Anthropic)
-│   ├── factor_mutator.py         systematic factor variants
+│   ├── factor_code_agent.py      LLM calls (OpenAI + Anthropic)
+│   ├── factor_dsl.py             constrained JSON/DSL expression compiler
+│   ├── factor_safety.py          static safety validator for generated modules
+│   ├── factor_mutator.py         DSL + legacy systematic factor variants
 │   ├── factor_agent_pipeline.py  compute → pickle → rank IC
 │   ├── factor_screener.py        grading (A/B/C/D/F) + thresholds
 │   ├── factor_neutralizer.py     mktcap / industry neutralization

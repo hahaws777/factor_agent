@@ -65,6 +65,7 @@ class MiningConfig:
     min_grade: str = "B"
     min_rank_ic: float = 0.015
     diversity_penalty: bool = True
+    diversity_corr_threshold: float = 0.90
     # generation
     seed_prompts: list = field(default_factory=lambda: [
         "20-day price momentum: past 20-day cumulative return, cross-sectionally ranked",
@@ -75,6 +76,13 @@ class MiningConfig:
     extra_factor_types: list = field(default_factory=lambda: [
         "momentum", "reversal", "volatility", "volume", "value_proxy", "earnings_quality"
     ])
+    generation_mode: str = "dsl"  # dsl | python
+    allowed_fields: list = field(default_factory=lambda: [
+        "open", "high", "low", "close", "volume", "amount", "vwap", "market_cap", "industry"
+    ])
+    max_expression_depth: int = 8
+    max_expression_nodes: int = 80
+    max_lookback_window: int = 252
     # mutation
     mutation_enabled: bool = True
     window_sweeps: list = field(default_factory=lambda: [5, 10, 20, 60])
@@ -87,6 +95,20 @@ class MiningConfig:
     eval_workers: int = 2       # level-2: IC workers per factor evaluation
     next_day_return: bool = True
     timeout_sec: int = 180
+    ic_similarity_threshold: float = 0.90
+    diversity_min_overlap: int = 10000
+    diversity_sample_size: int = 300000
+    train_start: str = ""
+    train_end: str = ""
+    validation_start: str = ""
+    validation_end: str = ""
+    test_start: str = ""
+    test_end: str = ""
+    recent_start: str = ""
+    recent_end: str = ""
+    transaction_cost_bps: float = 10.0
+    max_complexity_score: int = 60
+    compute_trade_metrics: bool = False
     # llm
     model: str = "gpt-4.1"
     provider: str = "openai"    # "openai" or "anthropic"
@@ -120,12 +142,18 @@ class MiningConfig:
         cfg.min_grade = m.get("min_grade", cfg.min_grade)
         cfg.min_rank_ic = m.get("min_rank_ic", cfg.min_rank_ic)
         cfg.diversity_penalty = m.get("diversity_penalty", cfg.diversity_penalty)
+        cfg.diversity_corr_threshold = m.get("diversity_corr_threshold", cfg.diversity_corr_threshold)
 
         g = raw.get("generation", {})
         if g.get("seed_prompts"):
             cfg.seed_prompts = g["seed_prompts"]
         if g.get("extra_factor_types"):
             cfg.extra_factor_types = g["extra_factor_types"]
+        cfg.generation_mode = g.get("mode", g.get("generation_mode", cfg.generation_mode))
+        cfg.allowed_fields = g.get("allowed_fields", cfg.allowed_fields)
+        cfg.max_expression_depth = g.get("max_expression_depth", cfg.max_expression_depth)
+        cfg.max_expression_nodes = g.get("max_expression_nodes", cfg.max_expression_nodes)
+        cfg.max_lookback_window = g.get("max_lookback_window", cfg.max_lookback_window)
 
         mut = raw.get("mutation", {})
         cfg.mutation_enabled = mut.get("enabled", cfg.mutation_enabled)
@@ -140,6 +168,20 @@ class MiningConfig:
         cfg.eval_workers = ev.get("workers", cfg.eval_workers)
         cfg.next_day_return = ev.get("next_day_return", cfg.next_day_return)
         cfg.timeout_sec = ev.get("timeout_sec", cfg.timeout_sec)
+        cfg.ic_similarity_threshold = ev.get("ic_similarity_threshold", cfg.ic_similarity_threshold)
+        cfg.diversity_min_overlap = ev.get("diversity_min_overlap", cfg.diversity_min_overlap)
+        cfg.diversity_sample_size = ev.get("diversity_sample_size", cfg.diversity_sample_size)
+        cfg.train_start = ev.get("train_start", cfg.train_start)
+        cfg.train_end = ev.get("train_end", cfg.train_end)
+        cfg.validation_start = ev.get("validation_start", cfg.validation_start)
+        cfg.validation_end = ev.get("validation_end", cfg.validation_end)
+        cfg.test_start = ev.get("test_start", cfg.test_start)
+        cfg.test_end = ev.get("test_end", cfg.test_end)
+        cfg.recent_start = ev.get("recent_start", cfg.recent_start)
+        cfg.recent_end = ev.get("recent_end", cfg.recent_end)
+        cfg.transaction_cost_bps = ev.get("transaction_cost_bps", cfg.transaction_cost_bps)
+        cfg.max_complexity_score = ev.get("max_complexity_score", cfg.max_complexity_score)
+        cfg.compute_trade_metrics = ev.get("compute_trade_metrics", cfg.compute_trade_metrics)
 
         ll = raw.get("llm", {})
         cfg.model = ll.get("model", cfg.model)
@@ -169,23 +211,64 @@ class FactorCandidate:
     code_hash: str
     generation: int
     parent: str | None = None
-    origin: str = "llm"        # llm | mutation | seed
+    origin: str = "llm"        # llm | mutation | seed | dsl | dsl_mutation
+    family: str = "unknown"
+    economic_hypothesis: str = ""
+    expression: str = ""
+    canonical_expression: str = ""
+    expected_sign: str = "unknown"
+    required_fields: list[str] = field(default_factory=list)
+    lookback_windows: list[int] = field(default_factory=list)
+    risk_notes: list[str] = field(default_factory=list)
+    why_not_duplicate: str = ""
     grade: str = "?"
     quality_score: int = 0
     mean_rank_ic: float = 0.0
     rank_ic_ir: float = 0.0
     rank_ic_win_rate: float = 0.0
+    ic_t_stat: float = 0.0
     valid_days: int = 0
+    coverage: float = 0.0
+    avg_cross_sectional_coverage: float = 0.0
+    factor_autocorr: float = 0.0
+    turnover_estimate: float = 0.0
+    long_short_spread_return: float = 0.0
+    cost_adjusted_long_short_return: float = 0.0
+    max_drawdown_long_short: float = 0.0
+    recent_rank_ic: float = 0.0
+    train_rank_ic: float = 0.0
+    validation_rank_ic: float = 0.0
+    test_rank_ic: float = 0.0
+    by_year_ic: dict[str, float] = field(default_factory=dict)
+    by_regime_ic: dict[str, float] = field(default_factory=dict)
+    industry_neutral_ic: float = 0.0
+    size_neutral_ic: float = 0.0
+    ic_series_max_similarity: float = 0.0
+    complexity_score: int = 0
+    alpha_direction: str = "unknown"
+    recommendation: str = "investigate"
     py_path: str = ""
     pkl_path: str = ""
     ic_csv_path: str = ""
     error: str = ""
     evaluated_at: str = ""
+    diversity_rejected: bool = False
+    max_similarity: float = 0.0
+    most_similar_to: str = ""
+    safety_severity: str = ""
+    safety_reasons: list[str] = field(default_factory=list)
+    suspicious_patterns: list[str] = field(default_factory=list)
 
     def passes(self, cfg: MiningConfig) -> bool:
         grade_ok = GRADE_ORDER.get(self.grade, 0) >= GRADE_ORDER.get(cfg.min_grade, 0)
         ic_ok = abs(self.mean_rank_ic) >= cfg.min_rank_ic
-        return grade_ok and ic_ok and not self.error
+        stable_ok = True
+        if self.validation_rank_ic:
+            stable_ok = abs(self.validation_rank_ic) >= cfg.min_rank_ic * 0.5
+        if self.test_rank_ic:
+            stable_ok = stable_ok and abs(self.test_rank_ic) >= cfg.min_rank_ic * 0.5
+        complexity_ok = self.complexity_score <= cfg.max_complexity_score if self.complexity_score else True
+        return grade_ok and ic_ok and stable_ok and complexity_ok and not self.error and not self.diversity_rejected
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -303,6 +386,57 @@ def _build_generation_prompt(
     return base
 
 
+def _build_dsl_generation_prompt(
+    description: str,
+    survivors: list[FactorCandidate],
+    factor_type_hint: str,
+    cfg: MiningConfig,
+) -> str:
+    families = " | ".join(cfg.extra_factor_types + ["liquidity", "quality_proxy", "composite"])
+    fields = ", ".join(cfg.allowed_fields)
+    operators = (
+        "delay(x,n), delta(x,n), ts_return(x,n), ts_mean(x,n), ts_std(x,n), "
+        "ts_rank(x,n), ts_zscore(x,n), ts_corr(x,y,n), rank(x), zscore(x), "
+        "winsorize(x,lower=0.01,upper=0.99), signed_power(x,p), log1p_abs(x), "
+        "neutralize_industry(x), neutralize_size(x)"
+    )
+    base = f"""Generate ONE alpha factor specification as strict JSON only.
+
+Description: {description.strip()}
+Preferred family: {factor_type_hint}
+
+Allowed families: {families}
+Allowed raw fields: {fields}
+Allowed operators: {operators}
+Rules:
+- Do not output Python code.
+- Do not use future returns, labels, target columns, negative shifts, centered rolling, or full-sample normalization.
+- Window sizes must be positive integers <= {cfg.max_lookback_window}.
+- The expression must be a single DSL expression using only allowed fields/operators and +, -, *, /.
+- Use ts_return(close, n) for trailing returns.
+- Explain why the factor is economically different from prior survivors.
+
+Required JSON schema:
+{{
+  "name": "ascii_snake_case_name",
+  "family": "momentum | reversal | volatility | volume | liquidity | value_proxy | quality_proxy | composite",
+  "economic_hypothesis": "...",
+  "expression": "...",
+  "expected_sign": "positive | negative | unknown",
+  "required_fields": ["close", "volume"],
+  "lookback_windows": [5, 20],
+  "risk_notes": ["..."],
+  "why_not_duplicate": "..."
+}}
+"""
+    if survivors:
+        base += "\nExisting accepted factors to avoid duplicating:\n"
+        for s in survivors[:8]:
+            detail = s.expression or s.economic_hypothesis or s.name
+            base += f"- {s.name}: family={s.family}, sign={s.expected_sign}, expr={detail[:240]}\n"
+    return base
+
+
 # ── Factor evaluation ─────────────────────────────────────────────────────────
 
 def _patch_data_root(code: str, root: Path) -> str:
@@ -328,6 +462,7 @@ def _evaluate_candidate(
 ) -> FactorCandidate:
     """Run one factor through the full pipeline: pickle → Rank IC → screen."""
     from factor_screener import screen_ic_csv
+    from factor_safety import validate_factor_code
 
     py_path = run_dir / "factors" / f"{candidate.name}.py"
     pkl_path = run_dir / "factors" / f"{candidate.name}.pkl"
@@ -339,6 +474,17 @@ def _evaluate_candidate(
     candidate.py_path = str(py_path)
     candidate.pkl_path = str(pkl_path)
     candidate.ic_csv_path = str(ic_csv)
+
+    safety = validate_factor_code(candidate.code)
+    candidate.safety_severity = safety.severity
+    candidate.safety_reasons = safety.reasons
+    candidate.suspicious_patterns = safety.suspicious_patterns
+    if not safety.is_safe:
+        py_path.write_text(_patch_data_root(candidate.code, ROOT), encoding="utf-8")
+        candidate.error = "rejected by safety validator: " + "; ".join(safety.reasons[:5])
+        candidate.evaluated_at = datetime.utcnow().isoformat()
+        log.warning("Safety rejected %s: %s", candidate.name, candidate.error)
+        return candidate
 
     # Step 1: compute factor and save pkl
     pipe_script = AGENT_DIR / "factor_agent_pipeline.py"
@@ -385,6 +531,7 @@ def _evaluate_candidate(
         candidate.rank_ic_ir = float(m.get("rank_ic_ir") or 0)
         candidate.rank_ic_win_rate = float(m.get("rank_ic_win_rate") or 0)
         candidate.valid_days = int(m.get("valid_days") or 0)
+        _enrich_candidate_metrics(candidate, cfg)
     else:
         candidate.error = "no IC CSV produced"
 
@@ -393,6 +540,236 @@ def _evaluate_candidate(
              candidate.name, candidate.grade, candidate.mean_rank_ic,
              candidate.rank_ic_ir, elapsed)
     return candidate
+
+
+def _candidate_rank_key(c: FactorCandidate) -> tuple[int, float, float, float, int]:
+    validation_bonus = abs(c.validation_rank_ic) if c.validation_rank_ic else 0.0
+    recent_bonus = abs(c.recent_rank_ic) if c.recent_rank_ic else 0.0
+    return (
+        GRADE_ORDER.get(c.grade, 0),
+        validation_bonus,
+        recent_bonus,
+        abs(c.mean_rank_ic),
+        -c.complexity_score,
+    )
+
+
+def _enrich_candidate_metrics(candidate: FactorCandidate, cfg: MiningConfig) -> None:
+    """Add robust but optional metrics while preserving the old Rank IC fields."""
+    _enrich_ic_metrics(candidate, cfg)
+    _enrich_factor_panel_metrics(candidate, cfg)
+    if cfg.compute_trade_metrics:
+        _enrich_trade_metrics(candidate, cfg)
+    candidate.alpha_direction = "inverse_alpha" if candidate.mean_rank_ic < 0 else "positive_alpha"
+    warnings = []
+    if candidate.complexity_score > cfg.max_complexity_score:
+        warnings.append("high complexity")
+    if candidate.validation_rank_ic and abs(candidate.validation_rank_ic) < cfg.min_rank_ic * 0.5:
+        warnings.append("weak validation IC")
+    if candidate.test_rank_ic and abs(candidate.test_rank_ic) < cfg.min_rank_ic * 0.5:
+        warnings.append("weak test IC")
+    if candidate.turnover_estimate and candidate.turnover_estimate > 0.8:
+        warnings.append("high turnover")
+    if candidate.passes(cfg):
+        candidate.recommendation = "keep"
+    elif warnings:
+        candidate.recommendation = "investigate: " + ", ".join(warnings)
+    else:
+        candidate.recommendation = "reject"
+
+
+def _enrich_ic_metrics(candidate: FactorCandidate, cfg: MiningConfig) -> None:
+    import numpy as np
+    import pandas as pd
+
+    try:
+        df = pd.read_csv(candidate.ic_csv_path)
+    except Exception as e:
+        log.warning("Could not read IC CSV for advanced metrics (%s): %s", candidate.name, e)
+        return
+    if "date" not in df.columns or "rank_ic" not in df.columns:
+        return
+
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["rank_ic"] = pd.to_numeric(df["rank_ic"], errors="coerce")
+    ric = df["rank_ic"].dropna()
+    if len(ric) > 1:
+        std = float(ric.std())
+        candidate.ic_t_stat = float(ric.mean() / std * np.sqrt(len(ric))) if std > 0 else 0.0
+    candidate.by_year_ic = {
+        str(int(year)): float(group["rank_ic"].mean())
+        for year, group in df.dropna(subset=["date"]).groupby(df["date"].dt.year)
+        if group["rank_ic"].notna().any()
+    }
+
+    candidate.train_rank_ic = _window_mean_rank_ic(df, cfg.train_start, cfg.train_end)
+    candidate.validation_rank_ic = _window_mean_rank_ic(df, cfg.validation_start, cfg.validation_end)
+    candidate.test_rank_ic = _window_mean_rank_ic(df, cfg.test_start, cfg.test_end)
+    candidate.recent_rank_ic = _window_mean_rank_ic(df, cfg.recent_start, cfg.recent_end)
+    if not candidate.recent_rank_ic and len(df) >= 60:
+        candidate.recent_rank_ic = float(df.tail(60)["rank_ic"].mean())
+
+
+def _window_mean_rank_ic(df, start: str, end: str) -> float:
+    import pandas as pd
+
+    if not start and not end:
+        return 0.0
+    mask = pd.Series(True, index=df.index)
+    if start:
+        mask &= df["date"] >= pd.Timestamp(start)
+    if end:
+        mask &= df["date"] <= pd.Timestamp(end)
+    s = df.loc[mask, "rank_ic"].dropna()
+    return float(s.mean()) if len(s) else 0.0
+
+
+def _enrich_factor_panel_metrics(candidate: FactorCandidate, cfg: MiningConfig) -> None:
+    import pandas as pd
+
+    path = Path(candidate.pkl_path)
+    if not path.is_file():
+        return
+    try:
+        fac = pd.read_pickle(path)
+    except Exception as e:
+        log.warning("Could not read factor pkl for advanced metrics (%s): %s", candidate.name, e)
+        return
+    if not isinstance(fac, pd.DataFrame) or fac.empty:
+        return
+    s = pd.to_numeric(fac.iloc[:, 0], errors="coerce")
+    candidate.coverage = float(s.notna().mean())
+    try:
+        by_date = s.rename("factor").reset_index().groupby("date")["factor"].agg(["count", "size"])
+        daily_cov = by_date["count"] / by_date["size"].replace(0, pd.NA)
+        candidate.avg_cross_sectional_coverage = float(daily_cov.mean())
+    except Exception:
+        pass
+    try:
+        wide = s.unstack("order_book_id").sort_index()
+        candidate.factor_autocorr = float(wide.corrwith(wide.shift(1), axis=1).mean())
+        ranks = wide.rank(axis=1, pct=True)
+        candidate.turnover_estimate = float((ranks - ranks.shift(1)).abs().mean(axis=1).mean())
+    except Exception as e:
+        log.debug("Could not compute factor autocorr/turnover for %s: %s", candidate.name, e)
+
+
+def _enrich_trade_metrics(candidate: FactorCandidate, cfg: MiningConfig) -> None:
+    import numpy as np
+    import pandas as pd
+
+    factor_path = Path(candidate.pkl_path)
+    data_path = ROOT / cfg.data_pkl
+    if not factor_path.is_file() or not data_path.is_file():
+        return
+    try:
+        fac = pd.read_pickle(factor_path)
+        data = pd.read_pickle(data_path)
+    except Exception as e:
+        log.warning("Could not load data for trade metrics (%s): %s", candidate.name, e)
+        return
+    required = {"order_book_id", "date", "close"}
+    if not required.issubset(data.columns) or not isinstance(fac, pd.DataFrame):
+        return
+    try:
+        f = fac.iloc[:, 0].rename("factor").reset_index()
+        f["date"] = pd.to_datetime(f["date"]).dt.normalize()
+        f["order_book_id"] = f["order_book_id"].astype(str)
+        px = data[["order_book_id", "date", "close"]].copy()
+        px["date"] = pd.to_datetime(px["date"]).dt.normalize()
+        px["order_book_id"] = px["order_book_id"].astype(str)
+        px = px.sort_values(["order_book_id", "date"])
+        px["ret_fwd"] = px.groupby("order_book_id")["close"].pct_change().groupby(px["order_book_id"]).shift(-1)
+        merged = f.merge(px[["order_book_id", "date", "ret_fwd"]], on=["order_book_id", "date"], how="inner").dropna()
+        if merged.empty:
+            return
+        merged["rank"] = merged.groupby("date")["factor"].rank(pct=True)
+        long_mask = merged["rank"] >= 0.9
+        short_mask = merged["rank"] <= 0.1
+        daily_long = merged.loc[long_mask].groupby("date")["ret_fwd"].mean()
+        daily_short = merged.loc[short_mask].groupby("date")["ret_fwd"].mean()
+        ls = (daily_long - daily_short).dropna()
+        if candidate.mean_rank_ic < 0:
+            ls = -ls
+        if ls.empty:
+            return
+        cost = (cfg.transaction_cost_bps / 10000.0) * 2.0 * (candidate.turnover_estimate or 0.0)
+        cost_adj = ls - cost
+        equity = (1.0 + cost_adj.fillna(0)).cumprod()
+        drawdown = equity / equity.cummax() - 1.0
+        candidate.long_short_spread_return = float(ls.mean())
+        candidate.cost_adjusted_long_short_return = float(cost_adj.mean())
+        candidate.max_drawdown_long_short = float(drawdown.min()) if len(drawdown) else 0.0
+    except Exception as e:
+        log.warning("Could not compute trade metrics for %s: %s", candidate.name, e)
+
+
+def _load_factor_series(candidate: FactorCandidate, cfg: MiningConfig):
+    import pandas as pd
+
+    if not candidate.pkl_path:
+        return None
+    path = Path(candidate.pkl_path)
+    if not path.is_file():
+        return None
+    try:
+        df = pd.read_pickle(path)
+    except Exception as e:
+        log.warning("Could not read factor pkl for diversity check (%s): %s", candidate.name, e)
+        return None
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return None
+    series = pd.to_numeric(df.iloc[:, 0], errors="coerce").dropna()
+    if cfg.diversity_sample_size and len(series) > cfg.diversity_sample_size:
+        series = series.sample(n=cfg.diversity_sample_size, random_state=7).sort_index()
+    return series
+
+
+def _factor_similarity(left: FactorCandidate, right: FactorCandidate, cfg: MiningConfig, cache: dict[str, Any]) -> float | None:
+    import numpy as np
+
+    if left.name not in cache:
+        cache[left.name] = _load_factor_series(left, cfg)
+    if right.name not in cache:
+        cache[right.name] = _load_factor_series(right, cfg)
+    left_s = cache[left.name]
+    right_s = cache[right.name]
+    if left_s is None or right_s is None:
+        return None
+    aligned = left_s.rename("left").to_frame().join(right_s.rename("right"), how="inner").dropna()
+    if len(aligned) < cfg.diversity_min_overlap:
+        return None
+    corr = aligned["left"].corr(aligned["right"], method="spearman")
+    if corr is None or np.isnan(corr):
+        return None
+    return float(abs(corr))
+
+
+def _ic_series_similarity(left: FactorCandidate, right: FactorCandidate) -> float | None:
+    import numpy as np
+    import pandas as pd
+
+    if not left.ic_csv_path or not right.ic_csv_path:
+        return None
+    lp = Path(left.ic_csv_path)
+    rp = Path(right.ic_csv_path)
+    if not lp.is_file() or not rp.is_file():
+        return None
+    try:
+        ldf = pd.read_csv(lp, usecols=["date", "rank_ic"])
+        rdf = pd.read_csv(rp, usecols=["date", "rank_ic"])
+    except Exception:
+        return None
+    ldf["date"] = pd.to_datetime(ldf["date"], errors="coerce")
+    rdf["date"] = pd.to_datetime(rdf["date"], errors="coerce")
+    aligned = ldf.merge(rdf, on="date", suffixes=("_l", "_r")).dropna()
+    if len(aligned) < 30:
+        return None
+    corr = aligned["rank_ic_l"].corr(aligned["rank_ic_r"], method="spearman")
+    if corr is None or np.isnan(corr):
+        return None
+    return float(abs(corr))
 
 
 # ── Main mining loop ──────────────────────────────────────────────────────────
@@ -446,9 +823,16 @@ class AlphaMiner:
     ) -> list[FactorCandidate]:
         """Generate n new factor candidates via LLM."""
         from factor_code_agent import extract_python_code, validate_python_syntax
+        from factor_dsl import DSLConfig, FactorSpec, compile_expression_to_module, validate_expression
 
         candidates = []
         factor_types = self.cfg.extra_factor_types
+        dsl_cfg = DSLConfig(
+            allowed_fields=set(self.cfg.allowed_fields),
+            max_window=self.cfg.max_lookback_window,
+            max_depth=self.cfg.max_expression_depth,
+            max_nodes=self.cfg.max_expression_nodes,
+        )
 
         # Use seed prompts for gen-0; diversified prompts for later generations
         if generation == 0:
@@ -465,7 +849,10 @@ class AlphaMiner:
         for i in range(n):
             desc = next(prompt_cycle)
             ft_hint = factor_types[i % len(factor_types)]
-            user_msg = _build_generation_prompt(desc, survivors, ft_hint)
+            if self.cfg.generation_mode == "dsl":
+                user_msg = _build_dsl_generation_prompt(desc, survivors, ft_hint, self.cfg)
+            else:
+                user_msg = _build_generation_prompt(desc, survivors, ft_hint)
 
             log.info("Generating factor %d/%d (gen %d)", i + 1, n, generation)
             try:
@@ -474,21 +861,47 @@ class AlphaMiner:
                 log.error("LLM generation failed: %s", e)
                 continue
 
-            code = extract_python_code(raw)
-            err = validate_python_syntax(code)
-            if err:
-                log.warning("Syntax error in generated code: %s", err)
-                continue
+            spec = None
+            validation = None
+            if self.cfg.generation_mode == "dsl":
+                try:
+                    spec = FactorSpec.from_json_text(raw)
+                    validation = validate_expression(spec.expression, dsl_cfg)
+                    if not validation.is_valid:
+                        log.warning("Invalid DSL expression from LLM: %s", "; ".join(validation.errors))
+                        continue
+                    code = compile_expression_to_module(spec, factor_name=spec.name, cfg=dsl_cfg)
+                except Exception as e:
+                    log.warning("Could not parse/compile LLM DSL JSON: %s", e)
+                    continue
+            else:
+                code = extract_python_code(raw)
+                err = validate_python_syntax(code)
+                if err:
+                    log.warning("Syntax error in generated code: %s", err)
+                    continue
 
             h = _code_hash(code)
             if self.cfg.dedup_on_code_hash and h in self._state.seen_hashes:
                 log.info("Duplicate code hash %s — skipping", h)
                 continue
 
-            name = f"gen{generation}_llm_{i:02d}_{h[:6]}"
+            base_name = spec.name if spec else "llm"
+            name = f"gen{generation}_{base_name}_{i:02d}_{h[:6]}"
             c = FactorCandidate(
                 name=name, code=code, code_hash=h,
-                generation=generation, origin="llm",
+                generation=generation,
+                origin="dsl" if spec else "llm",
+                family=spec.family if spec else ft_hint,
+                economic_hypothesis=spec.economic_hypothesis if spec else "",
+                expression=spec.expression if spec else "",
+                canonical_expression=validation.canonical_expression if validation else "",
+                expected_sign=spec.expected_sign if spec else "unknown",
+                required_fields=validation.required_fields if validation else [],
+                lookback_windows=validation.lookback_windows if validation else [],
+                risk_notes=spec.risk_notes if spec else [],
+                why_not_duplicate=spec.why_not_duplicate if spec else "",
+                complexity_score=validation.complexity_score if validation else 0,
             )
             candidates.append(c)
             self._state.seen_hashes.append(h)
@@ -504,7 +917,8 @@ class AlphaMiner:
         if not self.cfg.mutation_enabled or not survivors:
             return []
 
-        from factor_mutator import FactorMutator
+        from factor_dsl import DSLConfig, FactorSpec, compile_expression_to_module, validate_expression
+        from factor_mutator import FactorMutator, mutate_dsl_expression
 
         def _llm_fn(msg, model):
             return _call_llm_with_retry(msg, model, self.cfg)
@@ -519,6 +933,65 @@ class AlphaMiner:
 
         results = []
         for s in survivors:
+            if self.cfg.generation_mode == "dsl" and s.expression:
+                dsl_cfg = DSLConfig(
+                    allowed_fields=set(self.cfg.allowed_fields),
+                    max_window=self.cfg.max_lookback_window,
+                    max_depth=self.cfg.max_expression_depth,
+                    max_nodes=self.cfg.max_expression_nodes,
+                )
+                variants = mutate_dsl_expression(
+                    s.expression,
+                    windows=self.cfg.window_sweeps,
+                    transforms=self.cfg.transforms,
+                    include_sign_flip=s.expected_sign == "negative",
+                )
+                for vname, expr in variants[: self.cfg.max_variants_per_factor]:
+                    validation = validate_expression(expr, dsl_cfg)
+                    if not validation.is_valid:
+                        log.debug("Skipping invalid DSL mutation %s: %s", vname, "; ".join(validation.errors))
+                        continue
+                    spec = FactorSpec(
+                        name=f"{s.name}_{vname}",
+                        family=s.family,
+                        economic_hypothesis=s.economic_hypothesis,
+                        expression=expr,
+                        expected_sign=s.expected_sign,
+                        required_fields=validation.required_fields,
+                        lookback_windows=validation.lookback_windows,
+                        risk_notes=list(s.risk_notes),
+                        why_not_duplicate=f"DSL mutation {vname} from {s.name}",
+                    )
+                    try:
+                        vcode = compile_expression_to_module(spec, factor_name=spec.name, cfg=dsl_cfg)
+                    except Exception as e:
+                        log.debug("Could not compile DSL mutation %s: %s", vname, e)
+                        continue
+                    h = _code_hash(vcode)
+                    if self.cfg.dedup_on_code_hash and h in self._state.seen_hashes:
+                        continue
+                    c = FactorCandidate(
+                        name=f"gen{generation}_dsl_mut_{vname[:28]}_{h[:6]}",
+                        code=vcode,
+                        code_hash=h,
+                        generation=generation,
+                        parent=s.name,
+                        origin="dsl_mutation",
+                        family=s.family,
+                        economic_hypothesis=s.economic_hypothesis,
+                        expression=expr,
+                        canonical_expression=validation.canonical_expression,
+                        expected_sign=s.expected_sign,
+                        required_fields=validation.required_fields,
+                        lookback_windows=validation.lookback_windows,
+                        risk_notes=list(s.risk_notes),
+                        why_not_duplicate=spec.why_not_duplicate,
+                        complexity_score=validation.complexity_score,
+                    )
+                    results.append(c)
+                    self._state.seen_hashes.append(h)
+                continue
+
             variants = mutator.generate_all(
                 code=s.code,
                 base_name=s.name,
@@ -588,34 +1061,114 @@ class AlphaMiner:
 
         return results
 
+    def _apply_diversity_filter(
+        self,
+        candidates: list[FactorCandidate],
+        reference: list[FactorCandidate],
+    ) -> list[FactorCandidate]:
+        """Reject duplicate variants by expression, factor values, family pressure, and IC series."""
+        if not self.cfg.diversity_penalty:
+            return candidates
+
+        candidates = sorted(candidates, key=_candidate_rank_key, reverse=True)
+        accepted = [c for c in reference if c.passes(self.cfg)]
+        accepted_expr = {re.sub(r"\s+", "", c.canonical_expression or c.expression) for c in accepted if c.expression}
+        cache: dict[str, Any] = {}
+
+        for c in candidates:
+            if c.error or c.diversity_rejected:
+                continue
+
+            compact_expr = re.sub(r"\s+", "", c.canonical_expression or c.expression)
+            if compact_expr and compact_expr in accepted_expr:
+                c.diversity_rejected = True
+                c.most_similar_to = "same_expression"
+                c.max_similarity = 1.0
+                log.info("Diversity reject %-40s duplicate DSL expression", c.name)
+                continue
+
+            best_name = ""
+            best_corr = 0.0
+            best_ic_corr = 0.0
+            for other in accepted:
+                value_corr = _factor_similarity(c, other, self.cfg, cache)
+                if value_corr is not None and value_corr > best_corr:
+                    best_corr = value_corr
+                    best_name = other.name
+                ic_corr = _ic_series_similarity(c, other)
+                if ic_corr is not None and ic_corr > best_ic_corr:
+                    best_ic_corr = ic_corr
+
+            c.max_similarity = best_corr
+            c.ic_series_max_similarity = best_ic_corr
+            c.most_similar_to = best_name
+            if best_corr >= self.cfg.diversity_corr_threshold:
+                c.diversity_rejected = True
+                log.info("Diversity reject %-40s value_corr=%.3f vs %s", c.name, best_corr, best_name)
+                continue
+            if best_ic_corr >= self.cfg.ic_similarity_threshold:
+                c.diversity_rejected = True
+                c.most_similar_to = best_name or "similar_ic_series"
+                log.info("Diversity reject %-40s ic_series_corr=%.3f", c.name, best_ic_corr)
+                continue
+
+            if c.passes(self.cfg):
+                accepted.append(c)
+                if compact_expr:
+                    accepted_expr.add(compact_expr)
+
+        return candidates
+
     def _select_survivors(
         self,
         candidates: list[FactorCandidate],
         prev_survivors: list[FactorCandidate],
     ) -> list[FactorCandidate]:
-        """Pick top-k from (new candidates ∪ prev survivors)."""
+        """Family-aware survivor selection from new candidates and previous survivors."""
         pool = candidates + prev_survivors
         passing = [c for c in pool if c.passes(self.cfg)]
 
         if not passing:
             log.warning("No factors passed quality gates this generation — keeping best available")
-            passing = sorted(pool, key=lambda c: abs(c.mean_rank_ic), reverse=True)[:self.cfg.top_k_survivors]
-        else:
-            passing.sort(key=lambda c: (GRADE_ORDER.get(c.grade, 0), abs(c.mean_rank_ic)), reverse=True)
+            return sorted(pool, key=_candidate_rank_key, reverse=True)[: self.cfg.top_k_survivors]
 
-        # Diversity penalty: if two factors are near-identical, prefer the one with higher IC
-        if self.cfg.diversity_penalty:
-            unique_survivors: list[FactorCandidate] = []
-            seen_ric: list[float] = []
-            for c in passing:
-                if all(abs(c.mean_rank_ic - r) > 0.005 for r in seen_ric):
-                    unique_survivors.append(c)
-                    seen_ric.append(c.mean_rank_ic)
-                if len(unique_survivors) >= self.cfg.top_k_survivors:
-                    break
-            passing = unique_survivors or passing
+        ranked = sorted(passing, key=_candidate_rank_key, reverse=True)
+        selected: list[FactorCandidate] = []
 
-        return passing[: self.cfg.top_k_survivors]
+        def add(c: FactorCandidate | None) -> None:
+            if c and c.name not in {s.name for s in selected} and len(selected) < self.cfg.top_k_survivors:
+                selected.append(c)
+
+        add(ranked[0])  # best overall
+
+        best_by_family: dict[str, FactorCandidate] = {}
+        for c in ranked:
+            fam = c.family or "unknown"
+            if fam not in best_by_family:
+                best_by_family[fam] = c
+        for c in sorted(best_by_family.values(), key=_candidate_rank_key, reverse=True):
+            add(c)
+
+        low_corr = sorted(
+            passing,
+            key=lambda c: (c.max_similarity or 0.0, -abs(c.mean_rank_ic), c.complexity_score),
+        )
+        add(low_corr[0] if low_corr else None)
+
+        recent = sorted(passing, key=lambda c: abs(c.recent_rank_ic or c.mean_rank_ic), reverse=True)
+        add(recent[0] if recent else None)
+
+        exploratory = [
+            c for c in pool
+            if not c.error and not c.diversity_rejected and c.name not in {s.name for s in selected}
+        ]
+        exploratory.sort(key=lambda c: (abs(c.recent_rank_ic), -c.complexity_score, abs(c.mean_rank_ic)), reverse=True)
+        add(exploratory[0] if exploratory else None)
+
+        for c in ranked:
+            add(c)
+
+        return selected[: self.cfg.top_k_survivors]
 
     # ── Run ───────────────────────────────────────────────────────────────
 
@@ -662,6 +1215,7 @@ class AlphaMiner:
 
             # Evaluate
             evaluated = self._evaluate_batch(new_candidates)
+            evaluated = self._apply_diversity_filter(evaluated, self._candidates_from_state())
 
             # Update state
             for c in evaluated:
@@ -684,9 +1238,16 @@ class AlphaMiner:
 
             # Generation summary
             passing = [c for c in evaluated if c.passes(self.cfg)]
+            rejected = [c for c in evaluated if c.diversity_rejected]
+            unsafe = [c for c in evaluated if c.error.startswith("rejected by safety validator")]
             summary = (
-                f"Gen {gen} complete — {len(evaluated)} evaluated, {len(passing)} passed\n"
-                f"Survivors: " + ", ".join(f"{s.name}(grade={s.grade}, ric={s.mean_rank_ic:.4f})" for s in survivors)
+                f"Gen {gen} complete — {len(evaluated)} evaluated, {len(passing)} passed, "
+                f"{len(rejected)} diversity-rejected, {len(unsafe)} unsafe\n"
+                f"Survivors: "
+                + ", ".join(
+                    f"{s.name}(family={s.family}, grade={s.grade}, ric={s.mean_rank_ic:.4f}, dir={s.alpha_direction})"
+                    for s in survivors
+                )
             )
             log.info(summary)
             if self.cfg.notify_telegram:
@@ -708,12 +1269,15 @@ class AlphaMiner:
 
         all_c = self._candidates_from_state()
         evaluated = [c for c in all_c if not c.error]
+        unsafe = [c for c in all_c if c.error.startswith("rejected by safety validator")]
+        diversity_rejected = [c for c in evaluated if c.diversity_rejected]
         passing = [c for c in evaluated if c.passes(self.cfg)]
-        passing_sorted = sorted(passing, key=lambda c: abs(c.mean_rank_ic), reverse=True)
+        passing_sorted = sorted(passing, key=_candidate_rank_key, reverse=True)
 
         # Grade distribution
         from collections import Counter
         grade_dist = Counter(c.grade for c in evaluated)
+        family_dist = Counter(c.family or "unknown" for c in passing)
 
         lines = [
             f"# Alpha Mining Report — {self.run_id}",
@@ -721,6 +1285,7 @@ class AlphaMiner:
             f"**Started:** {self._state.started_at}  ",
             f"**Generations completed:** {self._state.generations_done}/{self.cfg.n_generations}  ",
             f"**Total evaluated:** {len(evaluated)}  |  **Passed:** {len(passing)}  ",
+            f"**Unsafe rejected:** {len(unsafe)}  |  **Diversity rejected:** {len(diversity_rejected)}  ",
             f"**Best grade:** {self._state.best_grade}  |  **Best Rank IC:** {self._state.best_mean_ric:.4f}",
             f"",
             f"## Grade Distribution",
@@ -731,14 +1296,36 @@ class AlphaMiner:
         for g in ["A", "B", "C", "D", "F"]:
             lines.append(f"| {g} | {grade_dist.get(g, 0)} |")
 
+        lines += ["", "## Family Distribution", "", "| Family | Passing Count |", "|--------|---------------|"]
+        for family, count in family_dist.most_common():
+            lines.append(f"| {family} | {count} |")
+
         lines += ["", "## Top Factors", "",
-                  "| Name | Gen | Origin | Grade | Mean Rank IC | IC IR | Win Rate |",
-                  "|------|-----|--------|-------|-------------|-------|----------|"]
+                  "| Name | Family | Direction | Grade | Mean RIC | Val RIC | Test RIC | Recent RIC | Turnover | Max Corr | Rec |",
+                  "|------|--------|-----------|-------|----------|---------|----------|------------|----------|----------|-----|"]
         for c in passing_sorted[:20]:
             lines.append(
-                f"| {c.name} | {c.generation} | {c.origin} | {c.grade} | "
-                f"{c.mean_rank_ic:.4f} | {c.rank_ic_ir:.3f} | {c.rank_ic_win_rate:.2%} |"
+                f"| {c.name} | {c.family} | {c.alpha_direction} | {c.grade} | "
+                f"{c.mean_rank_ic:.4f} | {c.validation_rank_ic:.4f} | {c.test_rank_ic:.4f} | "
+                f"{c.recent_rank_ic:.4f} | {c.turnover_estimate:.3f} | {c.max_similarity:.3f} | {c.recommendation} |"
             )
+
+        if unsafe:
+            lines += ["", "## Unsafe Rejections", "",
+                      "| Name | Origin | Safety Severity | Reasons |",
+                      "|------|--------|-----------------|---------|"]
+            for c in unsafe[:30]:
+                lines.append(f"| {c.name} | {c.origin} | {c.safety_severity} | {'; '.join(c.safety_reasons[:3])} |")
+
+        if diversity_rejected:
+            lines += ["", "## Duplicate And Diversity Rejections", "",
+                      "| Name | Family | Value Corr | IC-Series Corr | Most Similar To |",
+                      "|------|--------|------------|----------------|-----------------|"]
+            for c in sorted(diversity_rejected, key=lambda x: max(x.max_similarity, x.ic_series_max_similarity), reverse=True)[:30]:
+                lines.append(
+                    f"| {c.name} | {c.family} | {c.max_similarity:.3f} | "
+                    f"{c.ic_series_max_similarity:.3f} | {c.most_similar_to} |"
+                )
 
         lines += ["", "## Generation Evolution", ""]
         for gen_i in range(self._state.generations_done):
@@ -764,7 +1351,12 @@ class AlphaMiner:
             top_csv = self.run_dir / "top_factors.csv"
             with open(top_csv, "w", newline="", encoding="utf-8-sig") as f:
                 fields = ["name", "generation", "origin", "parent", "grade", "quality_score",
-                          "mean_rank_ic", "rank_ic_ir", "rank_ic_win_rate", "valid_days", "ic_csv_path"]
+                          "family", "expected_sign", "alpha_direction", "mean_rank_ic", "rank_ic_ir",
+                          "rank_ic_win_rate", "ic_t_stat", "valid_days", "coverage",
+                          "avg_cross_sectional_coverage", "factor_autocorr", "turnover_estimate",
+                          "recent_rank_ic", "train_rank_ic", "validation_rank_ic", "test_rank_ic",
+                          "max_similarity", "ic_series_max_similarity", "complexity_score",
+                          "recommendation", "expression", "ic_csv_path"]
                 w = _csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
                 w.writeheader()
                 w.writerows(asdict(c) for c in passing_sorted[:50])

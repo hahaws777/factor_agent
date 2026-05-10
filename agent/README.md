@@ -40,6 +40,32 @@ Requires `.env` with `OPENAI_API_KEY` when not using `--preset`. Market panel: `
 
 **Data rule:** The LLM is instructed to load **only** from `data.pkl` (`Path(__file__).resolve().parents[1] / "data.pkl"`). It must **not** use rqdatac, Tushare, or other remote APIs in generated `compute_factor_df()` code.
 
+## Alpha miner safety mode
+
+`alpha_miner.py` now defaults to a safer constrained workflow:
+
+1. The LLM returns a JSON factor spec, not a full Python module.
+2. `factor_dsl.py` validates and compiles the DSL expression into vectorized pandas code.
+3. `factor_safety.py` rejects unsafe code before evaluation, including lookahead patterns, target/label columns, external APIs, `eval`/`exec`, shell calls, file writes, and obvious non-DataFrame returns.
+4. The normal pipeline still computes `.pkl` and Rank IC, then the miner adds walk-forward/recent IC, coverage, autocorrelation, turnover, complexity, inverse-alpha labeling, factor-value correlation, and IC-series similarity.
+5. Survivor selection is family-aware, so one generation cannot be dominated by near-identical momentum/reversal variants.
+
+Use `agent/alpha_mining_config.yaml` to tune:
+
+```yaml
+generation:
+  mode: "dsl"   # set to "python" only for legacy full-module generation
+
+evaluation:
+  train_start: ""
+  validation_start: ""
+  test_start: ""
+  recent_start: ""
+  compute_trade_metrics: false
+```
+
+Unsafe or duplicate candidates are retained in the ledger/report with rejection reasons instead of being silently discarded.
+
 ## Chat UI (local)
 
 ```bash

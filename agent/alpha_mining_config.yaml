@@ -8,8 +8,14 @@ mining:
   min_grade: "B"            # minimum grade (A/B/C/D/F) for a factor to survive
   min_rank_ic: 0.015        # hard floor: factors below this are always dropped
   diversity_penalty: true   # penalise factors too similar to existing survivors
+  diversity_corr_threshold: 0.90
 
 generation:
+  mode: "dsl"               # dsl (safe JSON expression) or python (legacy full module)
+  allowed_fields: [open, high, low, close, volume, amount, vwap, market_cap, industry]
+  max_expression_depth: 8
+  max_expression_nodes: 80
+  max_lookback_window: 252
   seed_prompts:             # Round-0 starting prompts (overridden by survivors in later rounds)
     - "20-day price momentum: past 20-day return, cross-sectionally ranked"
     - "short-term reversal: negative 5-day return, winsorized 1-99%"
@@ -25,11 +31,12 @@ generation:
 
 mutation:
   enabled: true
-  window_sweeps: [5, 10, 20, 60]   # replace detected windows with these
+  window_sweeps: [5, 10, 20, 40, 60, 120]   # replace detected windows with these
   transforms:                       # transforms to try on top factors
     - winsorize
     - rank
     - zscore
+    - ts_rank
   max_variants_per_factor: 4        # cap mutations per surviving factor
   llm_refine: true                  # also ask LLM to intelligently improve survivors
 
@@ -43,6 +50,20 @@ evaluation:
   exclude_limit_down: true
   exclude_suspended: true
   timeout_sec: 180        # kill a factor evaluation after this many seconds
+  ic_similarity_threshold: 0.90
+  diversity_min_overlap: 10000
+  diversity_sample_size: 300000
+  transaction_cost_bps: 10.0
+  max_complexity_score: 60
+  compute_trade_metrics: false  # true reads data.pkl again per factor to estimate LS/cost/DD metrics
+  train_start: ""
+  train_end: ""
+  validation_start: ""
+  validation_end: ""
+  test_start: ""
+  test_end: ""
+  recent_start: ""
+  recent_end: ""
 
 llm:
   model: "gpt-4.1"                # for anthropic: e.g. claude-sonnet-4-6 or claude-opus-4-7
