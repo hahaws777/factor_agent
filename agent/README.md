@@ -70,15 +70,50 @@ Unsafe or duplicate candidates are retained in the ledger/report with rejection 
 
 Queue mode submits each candidate to the evaluation pool as soon as it is generated, so LLM generation and `factor_agent_pipeline.py` evaluation can overlap within the same generation. Set `pipeline_queue_enabled: false` to restore the old generate-then-evaluate batch flow.
 
+## Async Job Queue
+
+Long-running tasks — pipeline runs, batch analysis, alpha mining — are submitted to a SQLite job queue (`agent_runs/jobs.db`) and executed by a background worker. This prevents the Streamlit UI from blocking.
+
+**`job_queue.py`** — the queue API (no external dependencies, stdlib `sqlite3` only):
+
+| Function | Description |
+|----------|-------------|
+| `init_db()` | Create `jobs` table if absent (idempotent) |
+| `submit(job_type, params, run_id) → id` | Enqueue a new pending job |
+| `claim_next() → dict \| None` | Atomically claim one pending job (`BEGIN IMMEDIATE`) |
+| `update_status(job_id, status, *, error, pid, log_path)` | Partial update; sets `finished_at` on terminal status |
+| `get_job(job_id) → dict \| None` | Fetch one job row |
+| `list_jobs(limit) → list[dict]` | Most recent jobs, newest first |
+| `cancel_job(job_id)` | SIGTERM stored pid, mark cancelled |
+
+**`job_worker.py`** — the consumer process:
+
+```bash
+# From the project root:
+python agent/job_worker.py
+
+# Slower polling when idle:
+python agent/job_worker.py --poll-interval 5
+```
+
+The worker claims one pending job at a time, pipes stdout/stderr to `agent_runs/job_logs/<job_id>.log`, stores the subprocess pid in the DB so the UI can cancel it, and marks the job `success` (exit 0) or `failed` (non-zero). A crash in one job never crashes the worker. Stop cleanly with `Ctrl-C` or `SIGTERM`.
+
 ## Chat UI (local)
 
 ```bash
-cd /d e:\data
-pip install streamlit
+# Terminal 1 — start the worker first
+python agent/job_worker.py
+
+# Terminal 2 — start the UI
+cd e:\data
 streamlit run agent/ui/streamlit_app.py
 ```
 
-Opens a browser (default `http://localhost:8501`): multi-turn chat, streaming replies, save generated code to `generated_factors/`, and one-click **Run pipeline** (pickle + Rank IC + decile + plots) using `factor_agent_pipeline.py`. After a successful run, **scroll below the chat**: the main column shows **Rank IC metrics**, a **daily IC line chart**, and **decile PNGs** from `backtest_plots/` (this block renders after the sidebar updates session state).
+Opens a browser (default `http://localhost:8501`): multi-turn chat, streaming replies, save generated code to `generated_factors/`.
+
+**Run pipeline / batch / mining** buttons submit jobs to the queue instantly — the UI never blocks. Each button shows an inline status card that updates on rerender (job id, status, elapsed time, cancel button, collapsible log tail). A **Recent jobs** expander in the sidebar lists the 8 most recent jobs across all types.
+
+After a pipeline job succeeds, **scroll below the chat**: the main column shows **Rank IC metrics**, a **daily IC line chart**, and **decile PNGs** from `backtest_plots/`.
 
 ### Multi-level parallel in UI
 
@@ -89,4 +124,4 @@ Opens a browser (default `http://localhost:8501`): multi-turn chat, streaming re
 
 ### Run metadata
 
-Pipeline runs now write `run_metadata.json` automatically in the artifact directory (or to a custom path via `--metadata-out`).
+Pipeline runs write `run_metadata.json` automatically in the artifact directory (or to a custom path via `--metadata-out`).

@@ -11,9 +11,10 @@ Run from project root:
 
 from __future__ import annotations
 
+import json
 import multiprocessing
 import os
-import signal
+import re
 import subprocess
 import sys
 from datetime import datetime
@@ -23,6 +24,11 @@ ROOT = Path(__file__).resolve().parents[2]
 AGENT_DIR = ROOT / "agent"
 if str(AGENT_DIR) not in sys.path:
     sys.path.insert(0, str(AGENT_DIR))
+
+try:
+    import job_queue as _jq
+except Exception:
+    _jq = None  # type: ignore[assignment]
 
 import streamlit as st  # noqa: E402
 from factor_code_agent import (  # noqa: E402
@@ -46,6 +52,7 @@ CHAT_SYSTEM = (
 DOTENV = ROOT / ".env"
 MINING_DIR = ROOT / "agent_runs" / "mining"
 MINING_UI_STATE = MINING_DIR / "ui_state.json"
+JOB_LOG_DIR = ROOT / "agent_runs" / "job_logs"
 
 
 def _load_dotenv() -> None:
@@ -88,6 +95,57 @@ def _inject_theme_css():
         h1, h2, h3 { color: #f0f0f5 !important; }
         .stTextInput input, .stSelectbox div[data-baseweb="select"] { background: #1e1e26 !important; color: #e8e8ed !important; }
         hr { border-color: #2a2a34; }
+        .order-board {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 10px;
+            margin: 8px 0 14px 0;
+        }
+        .order-lane {
+            border: 1px solid #303241;
+            background: #171922;
+            border-radius: 8px;
+            padding: 10px;
+            min-height: 132px;
+        }
+        .order-lane h4 {
+            margin: 0 0 8px 0;
+            color: #f0f0f5;
+            font-size: 0.95rem;
+            letter-spacing: 0;
+        }
+        .order-ticket {
+            border: 1px solid #3a3d4e;
+            background: #20232e;
+            border-left: 4px solid #8aa4ff;
+            border-radius: 6px;
+            padding: 8px;
+            margin-top: 7px;
+        }
+        .order-ticket.running { border-left-color: #f1c75b; }
+        .order-ticket.success { border-left-color: #38d47a; }
+        .order-ticket.failed { border-left-color: #ff6b6b; }
+        .order-ticket.pending { border-left-color: #8aa4ff; }
+        .order-ticket.cancelled { border-left-color: #9aa0aa; }
+        .ticket-title { font-weight: 650; color: #f4f4f8; font-size: 0.9rem; }
+        .ticket-meta { color: #a8adbd; font-size: 0.78rem; margin-top: 3px; overflow-wrap: anywhere; }
+        .kitchen-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 10px;
+            margin: 8px 0 12px 0;
+        }
+        .kitchen-cell {
+            border: 1px solid #303241;
+            background: #161820;
+            border-radius: 8px;
+            padding: 10px;
+        }
+        .kitchen-label { color: #9ca3b5; font-size: 0.78rem; }
+        .kitchen-value { color: #f2f3f7; font-size: 1.08rem; font-weight: 700; margin-top: 3px; }
+        @media (max-width: 900px) {
+            .order-board, .kitchen-grid { grid-template-columns: 1fr; }
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -99,6 +157,25 @@ def _resolve_artifact_dir(artifact_dir: str) -> Path:
     if not p.is_absolute():
         p = (ROOT / p).resolve()
     return p.resolve()
+
+
+def _resolve_existing_path(raw: str) -> Path:
+    p = Path(str(raw))
+    if p.exists():
+        return p
+    text = str(raw).replace("\\", "/")
+    # Some artifacts are created by Windows Python and store E:/data paths;
+    # convert the common project root back to WSL form when the UI runs there.
+    for prefix in ("E:/data", "e:/data"):
+        if text.startswith(prefix):
+            candidate = ROOT / text[len(prefix):].lstrip("/")
+            if candidate.exists():
+                return candidate
+    if not p.is_absolute():
+        candidate = ROOT / p
+        if candidate.exists():
+            return candidate
+    return p
 
 
 def _tail_text(path: Path, max_lines: int = 160) -> str:
@@ -146,14 +223,12 @@ def _read_mining_ui_state() -> dict:
     if not MINING_UI_STATE.is_file():
         return {}
     try:
-        import json
         return json.loads(MINING_UI_STATE.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
 
 def _write_mining_ui_state(run_dir: Path, pid: int | None = None) -> None:
-    import json
     MINING_DIR.mkdir(parents=True, exist_ok=True)
     payload = {
         "current_run_id": run_dir.name,
@@ -183,7 +258,6 @@ def _mining_run_dirs() -> list[Path]:
 
 def _render_pipeline_artifacts(art: Path) -> None:
     """Show Rank IC table summary, charts, and decile plot images after a successful run."""
-    import json
     import pandas as pd
 
     st.subheader("Pipeline results")
@@ -236,7 +310,7 @@ def _render_pipeline_artifacts(art: Path) -> None:
                     st.markdown("**Daily IC / Rank IC**")
                     st.line_chart(plot_df)
             with st.expander("Rank IC table (first 200 rows)"):
-                st.dataframe(ic_df.head(200), use_container_width=True)
+                st.dataframe(ic_df.head(200), width="stretch")
 
     plot_dir = art / "backtest_plots"
     if plot_dir.is_dir():
@@ -245,7 +319,7 @@ def _render_pipeline_artifacts(art: Path) -> None:
             st.markdown("**Decile backtest plots**")
             cols = st.columns(2)
             for i, png in enumerate(pngs):
-                cols[i % 2].image(str(png), caption=png.name, use_container_width=True)
+                cols[i % 2].image(str(png), caption=png.name, width="stretch")
 
     bt = art / "backtest_results"
     if bt.is_dir():
@@ -260,7 +334,6 @@ def _render_pipeline_artifacts(art: Path) -> None:
 
 
 def _render_batch_artifacts(out_dir: Path) -> None:
-    import json
     import pandas as pd
 
     st.subheader("Batch analysis results")
@@ -294,20 +367,412 @@ def _render_batch_artifacts(out_dir: Path) -> None:
         show = show.sort_values("rank_ic_ir", ascending=False, na_position="last")
     cols = [c for c in ["factor_name", "mean_rank_ic", "rank_ic_ir", "rank_ic_win_rate", "valid_days", "elapsed_sec", "error"] if c in show.columns]
     if cols:
-        st.dataframe(show[cols].head(200), use_container_width=True)
+        st.dataframe(show[cols].head(200), width="stretch")
     else:
-        st.dataframe(show.head(200), use_container_width=True)
+        st.dataframe(show.head(200), width="stretch")
+
+
+def _backtest_factor_prefix(path: Path) -> str:
+    name = path.name
+    for suffix in (
+        "_decile_daily_returns.csv",
+        "_decile_cum_returns.csv",
+        "_decile_cum_all.png",
+        "_decile_cum_LS.png",
+    ):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return path.stem
+
+
+def _backtest_factor_lookup(art: Path, candidates_df=None) -> dict[str, dict]:
+    lookup: dict[str, dict] = {}
+
+    meta_dir = art / "backtest_results"
+    if meta_dir.is_dir():
+        for meta_path in sorted(meta_dir.glob("*_factor_meta.json")):
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            for key in (meta.get("name"), meta.get("factor_name"), meta_path.name.removesuffix("_factor_meta.json")):
+                if key:
+                    lookup[str(key)] = meta
+
+    if candidates_df is not None and not getattr(candidates_df, "empty", True):
+        for _, row in candidates_df.iterrows():
+            row_dict = row.to_dict()
+            name = str(row_dict.get("name") or "")
+            if name:
+                lookup[name] = row_dict
+            pkl_path = str(row_dict.get("pkl_path") or "")
+            if pkl_path:
+                lookup[Path(pkl_path).stem] = row_dict
+
+    return lookup
+
+
+def _factor_meta_for_path(path: Path, lookup: dict[str, dict]) -> tuple[str, dict]:
+    prefix = _backtest_factor_prefix(path)
+    meta = lookup.get(prefix, {})
+    if not meta:
+        for name, candidate in lookup.items():
+            if prefix == name or prefix.startswith(f"{name}_"):
+                return prefix, candidate
+    return prefix, meta
+
+
+def _render_factor_formula(meta: dict, prefix: str, *, compact: bool = False) -> None:
+    expr = str(meta.get("expression") or meta.get("canonical_expression") or "").strip()
+    factor_name = str(meta.get("name") or meta.get("factor_name") or prefix)
+    family = str(meta.get("family") or "unknown")
+    if compact:
+        if expr:
+            st.caption(f"{factor_name} · {family}")
+            st.code(expr, language="text")
+        return
+
+    st.markdown(f"**Backtest formula:** `{factor_name}` · `{family}`")
+    if expr:
+        st.code(expr, language="text")
+    else:
+        st.warning("Formula metadata not found for this backtest file.")
+    if meta.get("economic_hypothesis"):
+        st.caption(str(meta.get("economic_hypothesis")))
+
+
+def _render_backtest_artifacts(art: Path, title: str = "Backtest results", candidates_df=None) -> None:
+    import pandas as pd
+
+    bt_dir = art / "backtest_results"
+    plot_dir = art / "backtest_plots"
+    csvs = sorted(bt_dir.glob("*.csv")) if bt_dir.is_dir() else []
+    pngs = sorted(plot_dir.glob("*.png")) if plot_dir.is_dir() else []
+    if not csvs and not pngs:
+        st.info("No backtest result CSVs or plot images found yet.")
+        return
+
+    st.markdown(f"**{title}**")
+    lookup = _backtest_factor_lookup(art, candidates_df)
+    cum_csvs = [p for p in csvs if "cum" in p.name.lower()]
+    daily_csvs = [p for p in csvs if "daily" in p.name.lower()]
+    if cum_csvs:
+        selected_csv = st.selectbox(
+            "Cumulative return CSV",
+            [p.name for p in cum_csvs],
+            key=f"{art.name}_bt_cum_csv",
+        )
+        csv_path = next(p for p in cum_csvs if p.name == selected_csv)
+        prefix, meta = _factor_meta_for_path(csv_path, lookup)
+        _render_factor_formula(meta, prefix)
+        try:
+            cum_df = pd.read_csv(csv_path, parse_dates=["date"])
+            chart_cols = [c for c in cum_df.columns if c != "date"]
+            if chart_cols:
+                st.line_chart(cum_df.set_index("date")[chart_cols].sort_index())
+            with st.expander("Cumulative return table"):
+                st.dataframe(cum_df.tail(200), width="stretch", hide_index=True)
+        except Exception as e:
+            st.warning(f"Could not read backtest CSV {csv_path.name}: {e}")
+
+    if daily_csvs:
+        with st.expander("Daily backtest return CSVs"):
+            for p in daily_csvs:
+                prefix, meta = _factor_meta_for_path(p, lookup)
+                st.text(str(p.relative_to(ROOT)) if p.is_relative_to(ROOT) else str(p))
+                _render_factor_formula(meta, prefix, compact=True)
+
+    if pngs:
+        st.markdown("**Backtest images**")
+        cols = st.columns(2)
+        for i, png in enumerate(pngs):
+            prefix, meta = _factor_meta_for_path(png, lookup)
+            caption_name = str(meta.get("name") or meta.get("factor_name") or prefix)
+            cols[i % 2].image(str(png), caption=f"{png.name} · {caption_name}", width="stretch")
+
+    if lookup and (csvs or pngs):
+        mapped = []
+        for p in sorted({_backtest_factor_prefix(x) for x in (csvs + pngs)}):
+            meta = lookup.get(p, {})
+            if not meta:
+                for name, candidate in lookup.items():
+                    if p == name or p.startswith(f"{name}_"):
+                        meta = candidate
+                        break
+            mapped.append({
+                "backtest_prefix": p,
+                "factor": meta.get("name") or meta.get("factor_name") or "",
+                "family": meta.get("family") or "",
+                "expression": meta.get("expression") or meta.get("canonical_expression") or "",
+            })
+        with st.expander("Backtest formula map", expanded=False):
+            st.dataframe(pd.DataFrame(mapped), width="stretch", hide_index=True)
+
+
+def _extract_factor_expression_from_py(path: Path) -> str:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+    m = re.search(r"FACTOR_EXPRESSION\s*=\s*(['\"])(.*?)\1", text, flags=re.S)
+    if m:
+        return m.group(2).strip()
+    m = re.search(r"Expression:\s*(.+)", text)
+    return m.group(1).strip() if m else ""
+
+
+def _factor_artifact_rows(run_dir: Path, candidates_df=None) -> list[dict]:
+    by_name: dict[str, dict] = {}
+    if candidates_df is not None and not getattr(candidates_df, "empty", True):
+        for _, row in candidates_df.iterrows():
+            row_dict = row.to_dict()
+            name = str(row_dict.get("name") or "")
+            if name:
+                by_name[name] = row_dict
+
+    factors_dir = run_dir / "factors"
+    ic_dir = run_dir / "ic"
+    names = set(by_name)
+    if factors_dir.is_dir():
+        names.update(p.stem for p in factors_dir.glob("*.py"))
+        names.update(p.stem for p in factors_dir.glob("*.pkl"))
+    if ic_dir.is_dir():
+        for p in ic_dir.glob("*_rankic.csv"):
+            names.add(p.name.removesuffix("_rankic.csv"))
+
+    rows = []
+    for name in sorted(names):
+        meta = by_name.get(name, {})
+        py_path = factors_dir / f"{name}.py"
+        pkl_path = _resolve_existing_path(str(meta.get("pkl_path") or factors_dir / f"{name}.pkl"))
+        ic_path = _resolve_existing_path(str(meta.get("ic_csv_path") or ic_dir / f"{name}_rankic.csv"))
+        expression = str(meta.get("expression") or meta.get("canonical_expression") or "").strip()
+        if not expression and py_path.is_file():
+            expression = _extract_factor_expression_from_py(py_path)
+        rows.append({
+            "factor": name,
+            "family": meta.get("family") or "",
+            "grade": meta.get("grade") or "",
+            "mean_rank_ic": meta.get("mean_rank_ic"),
+            "rank_ic_ir": meta.get("rank_ic_ir"),
+            "alpha_direction": meta.get("alpha_direction") or "",
+            "expression": expression,
+            "py": str(py_path.relative_to(ROOT)) if py_path.is_file() and py_path.is_relative_to(ROOT) else (str(py_path) if py_path.is_file() else ""),
+            "pkl": str(pkl_path.relative_to(ROOT)) if pkl_path.is_file() and pkl_path.is_relative_to(ROOT) else (str(pkl_path) if pkl_path.is_file() else ""),
+            "ic_csv": str(ic_path.relative_to(ROOT)) if ic_path.is_file() and ic_path.is_relative_to(ROOT) else (str(ic_path) if ic_path.is_file() else ""),
+        })
+    return rows
+
+
+def _render_factor_artifacts(run_dir: Path, candidates_df=None) -> None:
+    import pandas as pd
+
+    rows = _factor_artifact_rows(run_dir, candidates_df)
+    if not rows:
+        st.info("No factor .py/.pkl/Rank IC artifacts found yet.")
+        return
+
+    st.markdown("**Generated factor artifacts**")
+    df_art = pd.DataFrame(rows)
+    show_cols = [
+        "factor", "family", "grade", "mean_rank_ic", "rank_ic_ir",
+        "alpha_direction", "expression", "py", "pkl", "ic_csv",
+    ]
+    st.dataframe(df_art[[c for c in show_cols if c in df_art.columns]], width="stretch", hide_index=True)
+
+    selected = st.selectbox(
+        "Open generated factor",
+        df_art["factor"].astype(str).tolist(),
+        key=f"{run_dir.name}_artifact_factor_select",
+    )
+    row = df_art[df_art["factor"].astype(str) == selected].iloc[0].to_dict()
+    st.markdown(f"**DSL formula for `{selected}`**")
+    st.code(str(row.get("expression") or ""), language="text")
+
+    py_path = ROOT / str(row.get("py") or "")
+    if py_path.is_file():
+        with st.expander("Generated Python module"):
+            st.code(py_path.read_text(encoding="utf-8", errors="replace")[:20000], language="python")
+
+    ic_path = ROOT / str(row.get("ic_csv") or "")
+    if ic_path.is_file():
+        try:
+            ic_df = pd.read_csv(ic_path, parse_dates=["date"])
+            chart_cols = [c for c in ("rank_ic", "ic") if c in ic_df.columns]
+            if chart_cols:
+                st.markdown("**Daily IC / Rank IC for selected artifact**")
+                st.line_chart(ic_df.set_index("date")[chart_cols].sort_index())
+        except Exception as e:
+            st.warning(f"Could not read Rank IC CSV: {e}")
+
+
+def _html_escape(value: object) -> str:
+    return (
+        str(value if value is not None else "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _job_elapsed(job: dict) -> str:
+    try:
+        start = job.get("started_at") or job.get("created_at")
+        end = job.get("finished_at") or datetime.now().astimezone().isoformat(timespec="seconds")
+        if not start:
+            return ""
+        t0 = datetime.fromisoformat(str(start))
+        t1 = datetime.fromisoformat(str(end))
+        seconds = max(0, int((t1 - t0).total_seconds()))
+        if seconds < 60:
+            return f"{seconds}s"
+        return f"{seconds // 60}m {seconds % 60}s"
+    except Exception:
+        return ""
+
+
+def _factor_station(row: dict) -> tuple[str, str]:
+    has_py = bool(row.get("py"))
+    has_pkl = bool(row.get("pkl"))
+    has_ic = bool(row.get("ic_csv"))
+    if has_ic:
+        return "Completed IC", "success"
+    if has_pkl:
+        return "Factor cooked", "running"
+    if has_py:
+        return "Formula ticketed", "pending"
+    return "Waiting", "pending"
+
+
+def _render_order_ticket(title: str, status: str, meta: list[str]) -> str:
+    meta_html = "".join(f"<div class='ticket-meta'>{_html_escape(x)}</div>" for x in meta if x)
+    return (
+        f"<div class='order-ticket {_html_escape(status)}'>"
+        f"<div class='ticket-title'>{_html_escape(title)}</div>"
+        f"{meta_html}"
+        "</div>"
+    )
+
+
+def _render_order_lane(title: str, tickets: list[str]) -> str:
+    body = "".join(tickets) if tickets else "<div class='ticket-meta'>Empty</div>"
+    return f"<div class='order-lane'><h4>{_html_escape(title)}</h4>{body}</div>"
+
+
+def _render_kitchen_pipeline_board(run_dir: Path, config: dict, candidates_df=None) -> None:
+    st.markdown("**Alpha mining order board**")
+
+    q_enabled = bool(config.get("pipeline_queue_enabled", True))
+    outer_workers = int(config.get("outer_workers", 1) or 1)
+    queue_size = int(config.get("pipeline_queue_size", 0) or max(2, outer_workers * 2))
+    eval_workers = int(config.get("eval_workers", config.get("workers", 1)) or 1)
+    factor_rows = _factor_artifact_rows(run_dir, candidates_df)
+    jobs = _jobs_for_run(run_dir.name, limit=30)
+
+    pending_jobs = [j for j in jobs if j.get("status") == "pending"]
+    running_jobs = [j for j in jobs if j.get("status") == "running"]
+    done_jobs = [j for j in jobs if j.get("status") == "success"]
+    bad_jobs = [j for j in jobs if j.get("status") in {"failed", "cancelled"}]
+
+    accepted = sum(1 for r in factor_rows if r.get("ic_csv"))
+    cooking = sum(1 for r in factor_rows if r.get("pkl") and not r.get("ic_csv"))
+    ticketed = sum(1 for r in factor_rows if r.get("py") and not r.get("pkl"))
+    errored = len(bad_jobs)
+
+    st.markdown(
+        f"""
+        <div class="kitchen-grid">
+          <div class="kitchen-cell"><div class="kitchen-label">Front counter</div><div class="kitchen-value">LLM + recipe picker</div></div>
+          <div class="kitchen-cell"><div class="kitchen-label">Order queue</div><div class="kitchen-value">{'On' if q_enabled else 'Off'} · cap {queue_size}</div></div>
+          <div class="kitchen-cell"><div class="kitchen-label">Kitchen stations</div><div class="kitchen-value">{outer_workers} consumers</div></div>
+          <div class="kitchen-cell"><div class="kitchen-label">IC line cooks</div><div class="kitchen-value">{eval_workers} workers / factor</div></div>
+        </div>
+        <div class="kitchen-grid">
+          <div class="kitchen-cell"><div class="kitchen-label">Formula tickets</div><div class="kitchen-value">{len(factor_rows)}</div></div>
+          <div class="kitchen-cell"><div class="kitchen-label">Cooking</div><div class="kitchen-value">{cooking + ticketed}</div></div>
+          <div class="kitchen-cell"><div class="kitchen-label">Served IC</div><div class="kitchen-value">{accepted}</div></div>
+          <div class="kitchen-cell"><div class="kitchen-label">Problems</div><div class="kitchen-value">{errored}</div></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    lanes = {
+        "1. New Orders": [
+            _render_order_ticket(
+                f"Job {j.get('id')} · {j.get('job_type')}",
+                str(j.get("status") or "pending"),
+                [str(j.get("run_id") or ""), str(j.get("created_at") or "")],
+            )
+            for j in pending_jobs[:5]
+        ],
+        "2. In Kitchen": [
+            _render_order_ticket(
+                f"Job {j.get('id')} · {j.get('job_type')}",
+                str(j.get("status") or "running"),
+                [f"PID {j.get('pid')}" if j.get("pid") else "", f"elapsed {_job_elapsed(j)}"],
+            )
+            for j in running_jobs[:5]
+        ],
+        "3. Served": [
+            _render_order_ticket(
+                str(r.get("factor") or ""),
+                _factor_station(r)[1],
+                [
+                    _factor_station(r)[0],
+                    str(r.get("expression") or ""),
+                    f"Rank IC {float(r['mean_rank_ic']):.4f}" if r.get("mean_rank_ic") not in (None, "") else "",
+                ],
+            )
+            for r in [x for x in factor_rows if x.get("ic_csv")][:5]
+        ],
+        "4. Needs Attention": [
+            _render_order_ticket(
+                f"Job {j.get('id')} · {j.get('job_type')}",
+                str(j.get("status") or "failed"),
+                [str(j.get("error") or "cancelled")[:140], str(j.get("finished_at") or "")],
+            )
+            for j in bad_jobs[:5]
+        ],
+    }
+    st.markdown(
+        "<div class='order-board'>"
+        + "".join(_render_order_lane(title, tickets) for title, tickets in lanes.items())
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+
+    if factor_rows:
+        with st.expander("Factor order tickets", expanded=True):
+            import pandas as pd
+
+            ticket_df = pd.DataFrame([
+                {
+                    "ticket": r.get("factor"),
+                    "station": _factor_station(r)[0],
+                    "family": r.get("family"),
+                    "grade": r.get("grade"),
+                    "mean_rank_ic": r.get("mean_rank_ic"),
+                    "expression": r.get("expression"),
+                }
+                for r in factor_rows
+            ])
+            st.dataframe(ticket_df, width="stretch", hide_index=True)
 
 
 def _render_mining_run(run_dir: Path) -> None:
     """Display alpha miner run status and top factors."""
-    import json
     import pandas as pd
 
     st.subheader(f"Mining run: {run_dir.name}")
     cp = run_dir / "checkpoint.json"
     if not cp.is_file():
         st.warning("Checkpoint not found yet. If the run just started, this is normal until the first generation finishes.")
+        _render_kitchen_pipeline_board(run_dir, config={}, candidates_df=None)
+        _render_factor_artifacts(run_dir)
+        _render_backtest_artifacts(run_dir, title="Run-level decile backtest results")
+        _render_run_jobs(run_dir.name)
         log_path = run_dir / "ui_alpha_miner.log"
         if log_path.is_file():
             st.markdown("**Mining process log**")
@@ -331,22 +796,11 @@ def _render_mining_run(run_dir: Path) -> None:
     col3.metric("Best mean Rank IC", f"{state.get('best_mean_ric', 0):.4f}")
     col4.metric("Total evaluated", len(candidates))
 
-    q_enabled = bool(config.get("pipeline_queue_enabled", True))
-    outer_workers = int(config.get("outer_workers", 1) or 1)
-    queue_size = int(config.get("pipeline_queue_size", 0) or max(2, outer_workers * 2))
-    eval_workers = int(config.get("eval_workers", config.get("workers", 1)) or 1)
-    with st.expander("Producer / Consumer pipeline", expanded=True):
-        p1, p2, p3, p4 = st.columns(4)
-        p1.metric("Producer", "LLM + mutations")
-        p2.metric("Queue", f"{queue_size}" if q_enabled else "off")
-        p3.metric("Consumers", outer_workers)
-        p4.metric("IC workers / factor", eval_workers)
-        st.caption(
-            "Producer creates safe DSL/Python candidates, the bounded queue buffers them, "
-            "consumer workers run safety validation, factor evaluation, Rank IC/backtest, then write checkpoint and ledger."
-        )
+    _render_kitchen_pipeline_board(run_dir, config, candidates_df=df)
 
     if not df.empty:
+        _render_factor_artifacts(run_dir, candidates_df=df)
+
         if "error" in df.columns:
             error_s = df["error"].fillna("").astype(str)
             rejected = int((error_s != "").sum())
@@ -385,7 +839,7 @@ def _render_mining_run(run_dir: Path) -> None:
         ]
         show_cols = [c for c in show_cols if c in df_show.columns]
         st.markdown("**Evaluated factors and formulas**")
-        st.dataframe(df_show[show_cols].head(200), use_container_width=True, hide_index=True)
+        st.dataframe(df_show[show_cols].head(200), width="stretch", hide_index=True)
 
         detail_names = df_show["name"].astype(str).tolist() if "name" in df_show.columns else []
         if detail_names:
@@ -414,7 +868,7 @@ def _render_mining_run(run_dir: Path) -> None:
                 }
                 st.json(diag)
 
-            ic_path = Path(str(row.get("ic_csv_path") or ""))
+            ic_path = _resolve_existing_path(str(row.get("ic_csv_path") or ""))
             if ic_path.is_file():
                 try:
                     ic_df = pd.read_csv(ic_path, parse_dates=["date"])
@@ -425,14 +879,67 @@ def _render_mining_run(run_dir: Path) -> None:
                 except Exception as e:
                     st.warning(f"Could not read selected factor IC CSV: {e}")
 
+            st.markdown("**Selected factor backtest**")
+            pkl_path = _resolve_existing_path(str(row.get("pkl_path") or ""))
+            if pkl_path.is_file():
+                if st.button("Run selected factor backtest + plots", key=f"{run_dir.name}_{selected}_bt", width="stretch"):
+                    bt_rankic = run_dir / "ic" / f"{selected}_bt_rankic.csv"
+                    bt_meta_dir = run_dir / "backtest_results"
+                    bt_meta_dir.mkdir(parents=True, exist_ok=True)
+                    bt_meta = {
+                        "name": selected,
+                        "factor_name": selected,
+                        "family": row.get("family") or "",
+                        "expression": row.get("expression") or row.get("canonical_expression") or "",
+                        "economic_hypothesis": row.get("economic_hypothesis") or "",
+                        "expected_sign": row.get("expected_sign") or "",
+                        "alpha_direction": row.get("alpha_direction") or "",
+                    }
+                    (bt_meta_dir / f"{selected}_factor_meta.json").write_text(
+                        json.dumps(bt_meta, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                    cmd = [
+                        sys.executable,
+                        str(ROOT / "scripts" / "analysis" / "factor_rankic_analysis.py"),
+                        "--factor", str(pkl_path),
+                        "--data", str(st.session_state.get("alpha_mining_data") or "data.pkl"),
+                        "--output", str(bt_rankic),
+                        "--workers", str(int(st.session_state.get("sb_pipeline_workers", 1))),
+                        "--backtest-decile",
+                        "--plot-backtest",
+                        "--backtest-output-dir", str(run_dir / "backtest_results"),
+                        "--plot-output-dir", str(run_dir / "backtest_plots"),
+                    ]
+                    if _jq is not None:
+                        job_id = _jq.submit(
+                            "factor_backtest",
+                            {"cmd": cmd, "cwd": str(ROOT), "artifact_dir": str(run_dir)},
+                            run_id=run_dir.name,
+                        )
+                        st.session_state["mining_backtest_job_id"] = job_id
+                        st.success(f"Backtest queued as job `{job_id}`")
+                    else:
+                        st.error("job_queue not available — cannot submit backtest job.")
+            else:
+                st.info("Selected factor pickle not found yet; backtest can run after factor evaluation writes the .pkl.")
+
+            _render_job_card(
+                st.session_state.get("mining_backtest_job_id"),
+                artifact_key="mining_run_dir",
+            )
+
     top_csv = run_dir / "top_factors.csv"
     if top_csv.is_file():
         with st.expander("Top survivors (top_factors.csv)"):
             try:
                 top_df = pd.read_csv(top_csv)
-                st.dataframe(top_df, use_container_width=True)
+                st.dataframe(top_df, width="stretch")
             except Exception as e:
                 st.warning(f"Could not read top_factors.csv: {e}")
+
+    _render_backtest_artifacts(run_dir, title="Run-level decile backtest results", candidates_df=df)
+    _render_run_jobs(run_dir.name)
 
     report = run_dir / "mining_report.md"
     if report.is_file():
@@ -443,6 +950,235 @@ def _render_mining_run(run_dir: Path) -> None:
     if log_path.is_file():
         with st.expander("Mining process log"):
             st.code(_tail_text(log_path), language="text")
+    elif _jq is not None:
+        # Job-queue runs write to job_logs/{id}.log — surface the latest mining job log.
+        mining_jobs = [j for j in _jobs_for_run(run_dir.name, limit=5) if j.get("job_type") in ("mining_start", "mining_resume")]
+        if mining_jobs:
+            lp = Path(str(mining_jobs[0].get("log_path") or ""))
+            if lp.is_file():
+                with st.expander("Mining process log (job queue)"):
+                    st.code(_tail_text(lp), language="text")
+
+
+def _render_job_card(job_id: int, artifact_key: str = "") -> None:
+    """Show a compact inline status card for a queued job, plus a log tail."""
+    if _jq is None or job_id is None:
+        return
+    try:
+        job = _jq.get_job(job_id)
+    except Exception:
+        return
+    if job is None:
+        return
+
+    status = job["status"]
+    elapsed = ""
+    if job.get("started_at") and job.get("finished_at"):
+        try:
+            t0 = datetime.fromisoformat(job["started_at"])
+            t1 = datetime.fromisoformat(job["finished_at"])
+            elapsed = f" · {int((t1 - t0).total_seconds())}s"
+        except Exception:
+            pass
+
+    pid_info = f"PID {job['pid']}" if job.get("pid") else ""
+    label = f"Job `{job_id}` [{status}]{elapsed} {pid_info}".strip()
+
+    if status == "success":
+        st.success(label)
+        # Restore artifact dir so pipeline/batch result panels appear.
+        if artifact_key:
+            try:
+                params = json.loads(job.get("params_json") or "{}")
+            except Exception:
+                params = {}
+            art = params.get("artifact_dir", "")
+            if art:
+                st.session_state[artifact_key] = str(_resolve_artifact_dir(art))
+            run_id = job.get("run_id") or params.get("run_id", "")
+            if run_id and artifact_key == "mining_run_dir":
+                st.session_state["mining_run_dir"] = str(MINING_DIR / run_id)
+    elif status == "running":
+        st.info(label)
+        if st.button("Cancel", key=f"cancel_job_{job_id}"):
+            _jq.cancel_job(job_id)
+            st.rerun()
+    elif status == "failed":
+        st.error(f"Job `{job_id}` failed — {job.get('error') or 'see log below'}")
+    elif status == "cancelled":
+        st.warning(label)
+    else:
+        st.info(f"Job `{job_id}` pending — start the worker to process.")
+
+    lp = job.get("log_path") or ""
+    if lp and Path(lp).is_file():
+        with st.expander(f"Log · job {job_id}", expanded=(status == "failed")):
+            st.code(_tail_text(Path(lp), max_lines=80), language="text")
+
+
+def _render_recent_jobs_sidebar() -> None:
+    """Compact expander showing the 8 most recent jobs."""
+    if _jq is None:
+        return
+    try:
+        jobs = _jq.list_jobs(limit=8)
+    except Exception:
+        return
+    if not jobs:
+        return
+    import pandas as pd
+    with st.expander("Recent jobs", expanded=False):
+        df = pd.DataFrame(jobs)[["id", "job_type", "status", "run_id", "created_at"]]
+        df.columns = ["#", "type", "status", "run_id", "submitted"]
+        st.dataframe(df, width="stretch", hide_index=True)
+
+
+def _jobs_for_run(run_id: str, limit: int = 12) -> list[dict]:
+    if _jq is None or not run_id:
+        return []
+    try:
+        jobs = _jq.list_jobs(limit=100)
+    except Exception:
+        return []
+    return [j for j in jobs if str(j.get("run_id") or "") == run_id][:limit]
+
+
+def _render_run_jobs(run_id: str) -> None:
+    jobs = _jobs_for_run(run_id)
+    if not jobs:
+        return
+    import pandas as pd
+
+    with st.expander("Jobs and logs for this run", expanded=True):
+        df = pd.DataFrame(jobs)[["id", "job_type", "status", "created_at", "finished_at", "error"]]
+        df.columns = ["#", "type", "status", "submitted", "finished", "error"]
+        st.dataframe(df, width="stretch", hide_index=True)
+        selected_job = st.selectbox(
+            "Inspect job log",
+            [int(j["id"]) for j in jobs],
+            format_func=lambda jid: f"job {jid}",
+            key=f"{run_id}_job_log_select",
+        )
+        job = next((j for j in jobs if int(j["id"]) == int(selected_job)), None)
+        lp = Path(str(job.get("log_path") or "")) if job else Path()
+        if lp.is_file():
+            st.code(_tail_text(lp, max_lines=120), language="text")
+        elif job:
+            st.caption("No log file written yet.")
+
+
+def _render_alpha_mining_console(_w_max: int, default_data_pkl: str) -> None:
+    st.subheader("Alpha Mining Console")
+    st.caption("Start/resume mining runs, inspect the producer-consumer pipeline, and review generated formulas.")
+
+    with st.expander("Prepared formula recipe library", expanded=False):
+        try:
+            import pandas as pd
+            from factor_recipe_library import PREPARED_FACTOR_RECIPES
+
+            recipe_df = pd.DataFrame([
+                {
+                    "recipe_id": r.recipe_id,
+                    "family": r.family,
+                    "name": r.name,
+                    "expected_sign": r.expected_sign,
+                    "expression": r.expression,
+                }
+                for r in PREPARED_FACTOR_RECIPES
+            ])
+            st.dataframe(recipe_df, width="stretch", hide_index=True)
+            st.caption("DSL mining asks the LLM to choose recipe_id; the system expands the expression locally.")
+        except Exception as e:
+            st.warning(f"Could not load prepared recipe library: {e}")
+
+    st.markdown("**Run controls**")
+    mining_dir = MINING_DIR
+    ui_state = _read_mining_ui_state()
+    default_run_id = f"mining_ui_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        st.text_input("Run ID", value=default_run_id, key="alpha_mining_run_id")
+        st.text_input("Config", value=str(AGENT_DIR / "alpha_mining_config.yaml"), key="alpha_mining_config")
+        st.text_input("Mining data", value=default_data_pkl, key="alpha_mining_data")
+    with c2:
+        st.number_input("Generations", min_value=1, max_value=50, value=1, step=1, key="alpha_mining_generations")
+        st.number_input("Factors / gen", min_value=1, max_value=100, value=3, step=1, key="alpha_mining_per_gen")
+        st.number_input("Outer consumers", min_value=1, max_value=_w_max, value=1, step=1, key="alpha_mining_outer_workers")
+
+    mining_job_id = st.session_state.get("mining_job_id")
+    if mining_job_id and _jq is not None:
+        _render_job_card(mining_job_id, artifact_key="mining_run_dir")
+
+    b1, b2 = st.columns([1, 1])
+    with b1:
+        if st.button("Start alpha mining", width="stretch"):
+            run_id = str(st.session_state.get("alpha_mining_run_id") or default_run_id).strip()
+            run_dir = mining_dir / run_id
+            run_dir.mkdir(parents=True, exist_ok=True)
+            cmd = [
+                sys.executable,
+                str(AGENT_DIR / "alpha_miner.py"),
+                "start",
+                "--run-id", run_id,
+                "--config", str(st.session_state.get("alpha_mining_config") or AGENT_DIR / "alpha_mining_config.yaml"),
+                "--generations", str(int(st.session_state.get("alpha_mining_generations", 1))),
+                "--per-gen", str(int(st.session_state.get("alpha_mining_per_gen", 3))),
+                "--model", str(st.session_state.get("sb_model", "gpt-4.1")),
+                "--provider", str(st.session_state.get("sb_provider", "openai")),
+                "--outer-workers", str(int(st.session_state.get("alpha_mining_outer_workers", 1))),
+                "--data", str(st.session_state.get("alpha_mining_data") or default_data_pkl),
+            ]
+            if _jq is not None:
+                job_id = _jq.submit("mining_start", {"cmd": cmd, "cwd": str(ROOT)}, run_id=run_id)
+                st.session_state["mining_job_id"] = job_id
+                st.session_state["mining_run_dir"] = str(run_dir)
+                _write_mining_ui_state(run_dir, ui_state.get("pid"))
+                st.success(f"Mining queued as job `{job_id}` (run: {run_id})")
+            else:
+                st.error("job_queue not available — cannot submit job.")
+    with b2:
+        if st.button("Refresh mining view", width="stretch"):
+            st.rerun()
+    st.caption("Jobs run through the SQLite queue. Use each job card's Cancel button for queued/running work.")
+
+    run_dirs = _mining_run_dirs()
+    if run_dirs:
+        st.markdown("**Existing runs**")
+        run_names = [d.name for d in run_dirs[:50]]
+        current_name = Path(str(st.session_state.get("mining_run_dir", ""))).name
+        default_index = run_names.index(current_name) if current_name in run_names else 0
+        selected_run = st.selectbox("Select run", run_names, index=default_index, key="sb_mining_run")
+        selected_dir = mining_dir / selected_run
+        can_resume = (selected_dir / "checkpoint.json").is_file()
+        if not can_resume:
+            st.caption("Selected run has no checkpoint yet, so resume is disabled. You can still view files/logs for diagnosis.")
+        v1, v2 = st.columns([1, 1])
+        with v1:
+            if st.button("View selected run", width="stretch"):
+                st.session_state["mining_run_dir"] = str(selected_dir)
+                _write_mining_ui_state(selected_dir, ui_state.get("pid"))
+        with v2:
+            if st.button("Resume selected run", width="stretch", disabled=not can_resume):
+                run_dir = selected_dir
+                run_dir.mkdir(parents=True, exist_ok=True)
+                cmd = [
+                    sys.executable,
+                    str(AGENT_DIR / "alpha_miner.py"),
+                    "resume",
+                    "--run-id", selected_run,
+                    "--config", str(st.session_state.get("alpha_mining_config") or AGENT_DIR / "alpha_mining_config.yaml"),
+                ]
+                if _jq is not None:
+                    job_id = _jq.submit("mining_resume", {"cmd": cmd, "cwd": str(ROOT)}, run_id=selected_run)
+                    st.session_state["mining_job_id"] = job_id
+                    st.session_state["mining_run_dir"] = str(run_dir)
+                    _write_mining_ui_state(run_dir, ui_state.get("pid"))
+                    st.success(f"Resume queued as job `{job_id}`")
+                else:
+                    st.error("job_queue not available — cannot submit job.")
+    else:
+        st.caption("No mining runs found.")
 
 
 def _stream_assistant(messages: list, model: str, temperature: float, provider: str = "openai"):
@@ -487,6 +1223,11 @@ def main():
         initial_sidebar_state="expanded",
     )
     _inject_theme_css()
+    if _jq is not None:
+        try:
+            _jq.init_db()
+        except Exception:
+            pass
 
     ok, err = _bootstrap_api_key()
     if not ok:
@@ -505,13 +1246,6 @@ def main():
         st.session_state.sb_provider = "anthropic" if (has_anthropic and not has_openai) else "openai"
     if "sb_model" not in st.session_state:
         st.session_state.sb_model = "gpt-4.1"
-    if "sb_temp" not in st.session_state:
-        st.session_state.sb_temp = 0.2
-    if "batch_factor_dir" not in st.session_state:
-        st.session_state.batch_factor_dir = "factors_by_type"
-    if "batch_out_dir" not in st.session_state:
-        st.session_state.batch_out_dir = f"rankic_batch_results"
-
     st.title("Factor Agent")
     st.caption("Chat · generate `compute_factor_df()` · optional Rank IC / decile backtest")
 
@@ -536,6 +1270,10 @@ def main():
             ["Chat / Pipeline", "Alpha Mining Console"],
             key="ui_view",
         )
+
+    _nc = int(multiprocessing.cpu_count() or 4)
+    _w_max = min(32, max(4, _nc))
+    _w_default = max(1, min(8, _nc))
 
     if ui_view == "Chat / Pipeline":
         for m in st.session_state.messages:
@@ -565,27 +1303,7 @@ def main():
                 full = "".join(collected)
                 st.session_state.messages.append({"role": "assistant", "content": full})
     else:
-        st.subheader("Alpha Mining Console")
-        st.caption("Use the Alpha Miner controls in the sidebar to start/resume runs. Results update from checkpoint files.")
-        with st.expander("Prepared formula recipe library"):
-            try:
-                import pandas as pd
-                from factor_recipe_library import PREPARED_FACTOR_RECIPES
-
-                recipe_df = pd.DataFrame([
-                    {
-                        "recipe_id": r.recipe_id,
-                        "family": r.family,
-                        "name": r.name,
-                        "expected_sign": r.expected_sign,
-                        "expression": r.expression,
-                    }
-                    for r in PREPARED_FACTOR_RECIPES
-                ])
-                st.dataframe(recipe_df, use_container_width=True, hide_index=True)
-                st.caption("DSL mining asks the LLM to choose recipe_id; the system expands the expression locally.")
-            except Exception as e:
-                st.warning(f"Could not load prepared recipe library: {e}")
+        _render_alpha_mining_console(_w_max, str(st.session_state.get("sb_data", "data.pkl")))
 
     last_code = None
     for m in reversed(st.session_state.messages):
@@ -626,9 +1344,6 @@ def main():
             value=st.session_state.artifact_default,
             key="sb_art",
         )
-        _nc = int(multiprocessing.cpu_count() or 4)
-        _w_max = min(32, max(4, _nc))
-        _w_default = max(1, min(8, _nc))
         st.selectbox(
             "Rank IC backend",
             ["pandas", "torch"],
@@ -661,7 +1376,7 @@ def main():
         save_path = gen_dir / save_name if save_name.endswith(".py") else gen_dir / f"{save_name}.py"
         st.caption("Latest extractable `compute_factor_df` module is used for save/run.")
         model = st.session_state.sb_model
-        if st.button("Save latest code → generated_factors", use_container_width=True, disabled=not last_code):
+        if st.button("Save latest code → generated_factors", width="stretch", disabled=not last_code):
             hdr = (
                 f"# Saved from Factor Agent UI — {datetime.now().isoformat(timespec='seconds')}\n"
                 f"# Model: {model}\n\n"
@@ -669,7 +1384,7 @@ def main():
             save_path.write_text(hdr + last_code, encoding="utf-8")
             st.success(f"Wrote {save_path.relative_to(ROOT)}")
 
-        if st.button("Run pipeline (pickle + Rank IC + backtest + plots)", use_container_width=True):
+        if st.button("Run pipeline (pickle + Rank IC + backtest + plots)", width="stretch"):
             if not last_code:
                 st.warning("No `compute_factor_df` in recent assistant replies.")
             else:
@@ -698,35 +1413,30 @@ def main():
                 cmd.extend(["--backend", _backend, "--device", _device, "--provider", _ui_provider])
                 if st.session_state.get("sb_pipeline_return_horizon") == "same-day diagnostic":
                     cmd.append("--no-next-day")
-                with st.spinner("Running pipeline… (timeout 10 min)"):
-                    try:
-                        proc = subprocess.run(
-                            cmd,
-                            cwd=str(ROOT),
-                            capture_output=True,
-                            text=True,
-                            encoding="utf-8",
-                            errors="replace",
-                            timeout=600,
-                        )
-                        st.code(proc.stdout + ("\n" + proc.stderr if proc.stderr else ""), language="text")
-                        if proc.returncode == 0:
-                            st.success("Pipeline finished OK.")
-                            st.session_state["pipeline_artifact_dir"] = str(_resolve_artifact_dir(artifact_dir))
-                        else:
-                            st.error(f"Exit code {proc.returncode}")
-                    except subprocess.TimeoutExpired:
-                        st.error("Pipeline timed out after 10 minutes. Use the Alpha Miner for long runs.")
+                if _jq is not None:
+                    job_id = _jq.submit(
+                        "pipeline",
+                        {"cmd": cmd, "cwd": str(ROOT), "artifact_dir": artifact_dir},
+                    )
+                    st.session_state["pipeline_job_id"] = job_id
+                    st.success(f"Queued as job `{job_id}` — the worker will run it.")
+                else:
+                    st.error("job_queue not available — cannot submit job.")
+
+        _render_job_card(
+            st.session_state.get("pipeline_job_id"),
+            artifact_key="pipeline_artifact_dir",
+        )
         st.divider()
         st.subheader("Batch analysis (multi-level parallel)")
         batch_factor_dir = st.text_input(
             "Factor dir",
-            value=st.session_state.batch_factor_dir,
+            value="factors_by_type",
             key="batch_factor_dir",
         )
         batch_out_dir = st.text_input(
             "Batch output dir",
-            value=st.session_state.batch_out_dir,
+            value="rankic_batch_results",
             key="batch_out_dir",
         )
         st.selectbox(
@@ -762,7 +1472,7 @@ def main():
             key="batch_return_horizon",
             help="Default is T signal vs T+1 return. Same-day is only for diagnostics.",
         )
-        if st.button("Run batch analysis", use_container_width=True):
+        if st.button("Run batch analysis", width="stretch"):
             batch_script = ROOT / "scripts" / "analysis" / "batch_factor_analysis.py"
             _factor_workers = int(st.session_state.get("batch_factor_workers", 1))
             _ic_workers = int(st.session_state.get("batch_ic_workers", _w_default))
@@ -787,151 +1497,23 @@ def main():
             ]
             if st.session_state.get("batch_return_horizon") == "same-day diagnostic":
                 cmd.append("--no-next-day")
-            with st.spinner("Running batch analysis…"):
-                proc = subprocess.run(
-                    cmd,
-                    cwd=str(ROOT),
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
+            if _jq is not None:
+                job_id = _jq.submit(
+                    "batch_analysis",
+                    {"cmd": cmd, "cwd": str(ROOT), "artifact_dir": batch_out_dir},
                 )
-            st.code(proc.stdout + ("\n" + proc.stderr if proc.stderr else ""), language="text")
-            if proc.returncode == 0:
-                st.success("Batch analysis finished OK.")
-                st.session_state["batch_artifact_dir"] = str(_resolve_artifact_dir(batch_out_dir))
+                st.session_state["batch_job_id"] = job_id
+                st.success(f"Queued as job `{job_id}` — the worker will run it.")
             else:
-                st.error(f"Exit code {proc.returncode}")
+                st.error("job_queue not available — cannot submit job.")
+
+        _render_job_card(
+            st.session_state.get("batch_job_id"),
+            artifact_key="batch_artifact_dir",
+        )
+        _render_recent_jobs_sidebar()
         st.divider()
-        st.subheader("Alpha Miner runs")
-        mining_dir = MINING_DIR
-        ui_state = _read_mining_ui_state()
-        default_run_id = f"mining_ui_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        st.text_input("Run ID", value=default_run_id, key="alpha_mining_run_id")
-        st.text_input("Config", value=str(AGENT_DIR / "alpha_mining_config.yaml"), key="alpha_mining_config")
-        mcols = st.columns(2)
-        with mcols[0]:
-            st.number_input("Generations", min_value=1, max_value=50, value=1, step=1, key="alpha_mining_generations")
-            st.number_input("Outer consumers", min_value=1, max_value=_w_max, value=1, step=1, key="alpha_mining_outer_workers")
-        with mcols[1]:
-            st.number_input("Factors / gen", min_value=1, max_value=100, value=3, step=1, key="alpha_mining_per_gen")
-            st.text_input("Mining data", value=data_pkl, key="alpha_mining_data")
-
-        proc = st.session_state.get("alpha_mining_proc")
-        if _process_running(proc):
-            st.caption(f"Running PID: `{proc.pid}`")
-            if st.button("Stop current mining process", use_container_width=True):
-                proc.terminate()
-                st.warning("Stop signal sent.")
-        elif _is_miner_pid(ui_state.get("pid")):
-            st.caption(f"Running PID from saved state: `{ui_state.get('pid')}`")
-            if st.button("Stop saved mining process", use_container_width=True):
-                pid = ui_state.get("pid")
-                if not _is_miner_pid(pid):
-                    st.warning("PID is no longer an alpha_miner process — stop skipped.")
-                else:
-                    try:
-                        os.kill(int(pid), signal.SIGTERM)
-                        st.warning("Stop signal sent to saved PID.")
-                    except Exception as e:
-                        st.error(f"Could not stop saved PID: {e}")
-        else:
-            if proc is not None:
-                rc = proc.poll()
-                st.caption(f"Last mining process exited: `{rc}`")
-
-        if st.button("Start alpha mining", use_container_width=True):
-            run_id = str(st.session_state.get("alpha_mining_run_id") or default_run_id).strip()
-            run_dir = mining_dir / run_id
-            run_dir.mkdir(parents=True, exist_ok=True)
-            log_path = run_dir / "ui_alpha_miner.log"
-            cmd = [
-                sys.executable,
-                str(AGENT_DIR / "alpha_miner.py"),
-                "start",
-                "--run-id",
-                run_id,
-                "--config",
-                str(st.session_state.get("alpha_mining_config") or AGENT_DIR / "alpha_mining_config.yaml"),
-                "--generations",
-                str(int(st.session_state.get("alpha_mining_generations", 1))),
-                "--per-gen",
-                str(int(st.session_state.get("alpha_mining_per_gen", 3))),
-                "--model",
-                str(st.session_state.get("sb_model", "gpt-4.1")),
-                "--provider",
-                str(st.session_state.get("sb_provider", "openai")),
-                "--outer-workers",
-                str(int(st.session_state.get("alpha_mining_outer_workers", 1))),
-                "--data",
-                str(st.session_state.get("alpha_mining_data") or data_pkl),
-            ]
-            log_f = open(log_path, "a", encoding="utf-8", buffering=1)
-            log_f.write(f"\n\n[{datetime.now().isoformat(timespec='seconds')}] RUN {' '.join(cmd)}\n")
-            proc = subprocess.Popen(
-                cmd,
-                cwd=str(ROOT),
-                stdout=log_f,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
-            # Keep the file handle in session state so it stays open while the
-            # process writes to it, and gets GC'd when the session ends.
-            st.session_state["alpha_mining_log_f"] = log_f
-            st.session_state["alpha_mining_proc"] = proc
-            st.session_state["mining_run_dir"] = str(run_dir)
-            _write_mining_ui_state(run_dir, proc.pid)
-            st.success(f"Alpha mining started: {run_id}")
-
-        run_dirs = _mining_run_dirs()
-        if run_dirs:
-            run_names = [d.name for d in run_dirs[:20]]
-            current_name = Path(str(st.session_state.get("mining_run_dir", ""))).name
-            default_index = run_names.index(current_name) if current_name in run_names else 0
-            selected_run = st.selectbox("Select run", run_names, index=default_index, key="sb_mining_run")
-            c_view, c_resume = st.columns(2)
-            with c_view:
-                if st.button("View", use_container_width=True):
-                    selected_dir = mining_dir / selected_run
-                    st.session_state["mining_run_dir"] = str(selected_dir)
-                    _write_mining_ui_state(selected_dir, ui_state.get("pid"))
-            with c_resume:
-                if st.button("Resume", use_container_width=True):
-                    run_dir = mining_dir / selected_run
-                    log_path = run_dir / "ui_alpha_miner.log"
-                    cmd = [
-                        sys.executable,
-                        str(AGENT_DIR / "alpha_miner.py"),
-                        "resume",
-                        "--run-id",
-                        selected_run,
-                        "--config",
-                        str(st.session_state.get("alpha_mining_config") or AGENT_DIR / "alpha_mining_config.yaml"),
-                    ]
-                    log_f = open(log_path, "a", encoding="utf-8", buffering=1)
-                    log_f.write(f"\n\n[{datetime.now().isoformat(timespec='seconds')}] RUN {' '.join(cmd)}\n")
-                    proc = subprocess.Popen(
-                        cmd,
-                        cwd=str(ROOT),
-                        stdout=log_f,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                    )
-                    st.session_state["alpha_mining_log_f"] = log_f
-                    st.session_state["alpha_mining_proc"] = proc
-                    st.session_state["mining_run_dir"] = str(run_dir)
-                    _write_mining_ui_state(run_dir, proc.pid)
-                    st.success(f"Resume started: {selected_run}")
-            if st.button("Refresh mining view", use_container_width=True):
-                st.rerun()
-        else:
-            st.caption("No mining runs found.")
-        st.divider()
-        if st.button("New conversation", use_container_width=True):
+        if st.button("New conversation", width="stretch"):
             st.session_state.messages = []
             st.rerun()
 

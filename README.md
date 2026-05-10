@@ -74,7 +74,19 @@ python agent/factor_agent_pipeline.py -d "20-day momentum" --data data.pkl --art
 python agent/factor_agent_pipeline.py -d "..." --provider anthropic --model claude-sonnet-4-6 --artifact-dir agent_runs/my_run
 ```
 
-### 6) Run Chat UI
+### 6) Run the Job Worker
+
+Long-running tasks (pipeline runs, batch analysis, alpha mining) are submitted to a SQLite job queue and executed by a background worker. Start it once in a dedicated terminal before using the UI:
+
+```bash
+python agent/job_worker.py
+# Custom poll interval (seconds between queue checks when idle):
+python agent/job_worker.py --poll-interval 5
+```
+
+The worker claims one pending job at a time, streams stdout/stderr to `agent_runs/job_logs/<job_id>.log`, and updates job status (pending → running → success/failed) in `agent_runs/jobs.db`. Stop with `Ctrl-C` or `SIGTERM`; the current job finishes cleanly before the worker exits.
+
+### 7) Run Chat UI
 
 ```bash
 streamlit run agent/ui/streamlit_app.py
@@ -82,9 +94,12 @@ streamlit run agent/ui/streamlit_app.py
 
 The UI supports:
 - **Provider selection** — switch between OpenAI and Anthropic models in the sidebar
+- **Async job submission** — pipeline runs, batch analysis, and mining start/resume are submitted to the job queue instantly; the UI never blocks waiting for results
+- **Inline job status** — each submit button shows a live status card (pending / running / success / failed) with a collapsible log tail and a cancel button
+- **Recent jobs panel** — compact sidebar expander listing the 8 most recent jobs across all types
 - **Multi-level parallel controls** — Level-2 per-day IC workers for single runs; Level-1 factor workers + Level-2 IC workers for batch
 - **Backend/device selection** — `pandas` or `torch` with `cuda/cpu/auto`
-- **Alpha Miner viewer** — browse mining run status and top factors directly from the UI
+- **Alpha Miner viewer** — browse mining run checkpoint, top factors, and full report directly from the UI
 
 ---
 
@@ -366,6 +381,8 @@ E:/data/
 │   ├── factor_screener.py        grading (A/B/C/D/F) + thresholds
 │   ├── factor_neutralizer.py     mktcap / industry neutralization
 │   ├── factor_orchestrator.py    single-factor + batch CLI
+│   ├── job_queue.py              SQLite-backed async job queue (submit/claim/status)
+│   ├── job_worker.py             background worker — polls queue, runs jobs as subprocesses
 │   └── ui/streamlit_app.py       chat UI + pipeline + batch + miner viewer
 ├── scripts/
 │   ├── analysis/
@@ -375,6 +392,8 @@ E:/data/
 │   └── download/
 │       └── download_index_data.py      akshare → index_data.pkl
 └── agent_runs/
+    ├── jobs.db                   SQLite job queue (auto-created on first run)
+    ├── job_logs/<job_id>.log     per-job stdout/stderr from the worker
     ├── mining/<run_id>/
     │   ├── checkpoint.json      resume state
     │   ├── factors/             generated .py + .pkl files
