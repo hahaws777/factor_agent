@@ -115,6 +115,10 @@ def ensure_multiindex(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_generated_module(py_path: Path):
+    from factor_code_agent import validate_ast_safety
+    safety_err = validate_ast_safety(py_path.read_text(encoding="utf-8"))
+    if safety_err:
+        raise RuntimeError(f"Unsafe generated code blocked before execution: {safety_err}")
     spec = importlib.util.spec_from_file_location("_factor_gen_mod", py_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Cannot load {py_path}")
@@ -157,6 +161,7 @@ def run_rank_ic_backtest(
     workers: int | None,
     backend: str,
     device: str,
+    transaction_cost_bps: float = 0.0,
 ) -> int:
     ana = ROOT / "scripts" / "analysis" / "factor_rankic_analysis.py"
     cmd = [
@@ -185,6 +190,8 @@ def run_rank_ic_backtest(
         cmd.extend(["--backend", str(backend)])
     if device:
         cmd.extend(["--device", str(device)])
+    if backtest_decile and transaction_cost_bps:
+        cmd.extend(["--transaction-cost-bps", str(transaction_cost_bps)])
     print("Running:", " ".join(cmd), flush=True)
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
@@ -225,6 +232,9 @@ def main():
     p.add_argument("--device", type=str, default="auto", help="Torch device when --backend torch")
     p.add_argument("--provider", type=str, default="openai", choices=["openai", "anthropic"],
                    help="LLM provider for factor generation: openai (default) or anthropic")
+    p.add_argument("--transaction-cost-bps", type=float, default=0.0,
+                   help="One-way transaction cost in bps for L/S backtest (default: 0). "
+                        "Applied 2x daily assuming 100%% turnover — conservative upper bound.")
     p.add_argument("--metadata-out", type=str, default="", help="Optional metadata json output path")
     args = p.parse_args()
 
@@ -347,7 +357,7 @@ def main():
         run_compute_and_pickle(py_path, pkl_path)
     except Exception as e:
         print(f"compute_factor_df failed: {e}", file=sys.stderr)
-        print("Fix the generated .py or rqdatac data access, then:", file=sys.stderr)
+        print("Fix the generated .py, then re-run with:", file=sys.stderr)
         print(f"  python agent/factor_agent_pipeline.py --skip-generate {py_path} --data {args.data}", file=sys.stderr)
         return finalize(
             "failed",
@@ -408,6 +418,7 @@ def main():
         workers=args.workers,
         backend=args.backend,
         device=args.device,
+        transaction_cost_bps=args.transaction_cost_bps,
     )
     metrics = _collect_rankic_metrics(rankic_out)
 

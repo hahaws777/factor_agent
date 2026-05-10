@@ -253,8 +253,7 @@ class FactorRankICAnalyzer:
         if not os.path.isfile(self.data_pkl):
             raise FileNotFoundError(f"Market data file not found: {self.data_pkl}")
 
-        with open(self.data_pkl, 'rb') as f:
-            self.market_data = pickle.load(f)
+        self.market_data = pd.read_pickle(self.data_pkl)
         self._prepare_market_index()
 
         log.info("Market data loaded: shape=%s  date range: %s to %s  columns=%s",
@@ -514,6 +513,9 @@ class FactorRankICAnalyzer:
         n_bins              : number of quantile buckets (default 10)
         exclude_st / limit_up / limit_down / suspended : filter flags
         use_next_day_return : use T+1 return for realistic trade execution
+        transaction_cost_bps: one-way cost in basis points. Applied as 2× every day
+                              (i.e. assumes 100% daily turnover) — this is a conservative
+                              upper bound. Real turnover is lower; use as a stress test.
 
         Results are stored in:
             self.backtest_daily_returns : DataFrame[date, Q1..Qn, LS]
@@ -588,6 +590,7 @@ class FactorRankICAnalyzer:
         ret_tbl = ret_tbl.rename(columns=col_map)
 
         # Long-short: top quantile minus bottom quantile, net of round-trip cost.
+        # Fixed-cost mode: assumes 100% daily turnover (conservative upper bound).
         # transaction_cost_bps is one-way; *2 for a full round-trip (long top + short bottom).
         q_low = f"Q1"
         q_high = f"Q{min(n_bins, len(ret_tbl.columns))}"
@@ -771,7 +774,10 @@ def main():
                        help='Optional: cumulative returns csv to plot (overrides in-memory)')
     parser.add_argument('--plot-output-dir', type=str, default=None,
                        help='Directory to save plots (default: backtest_plots)')
-    
+    parser.add_argument('--transaction-cost-bps', type=float, default=0,
+                       help='One-way transaction cost in basis points for L/S return (default: 0). '
+                            'Applied as 2x daily; assumes 100%% daily turnover — conservative upper bound.')
+
     args = parser.parse_args()
     
     # Run analysis
@@ -800,7 +806,8 @@ def main():
             exclude_limit_down=not args.no_filter_limit_down_bt,
             exclude_suspended=not args.no_filter_suspended_bt,
             use_next_day_return=not args.no_next_day_bt,
-            workers=args.workers
+            workers=args.workers,
+            transaction_cost_bps=args.transaction_cost_bps,
         ).save_backtest(output_dir=args.backtest_output_dir)
 
     if args.plot_backtest:

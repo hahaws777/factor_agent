@@ -292,6 +292,7 @@ class MiningState:
     all_candidates: list[dict] = field(default_factory=list)   # serialised FactorCandidates
     survivors: list[str] = field(default_factory=list)         # names of current survivors
     seen_hashes: list[str] = field(default_factory=list)       # dedup registry
+    seen_expressions: list[str] = field(default_factory=list)  # pre-eval expression dedup
     best_grade: str = "F"
     best_mean_ric: float = 0.0
 
@@ -314,6 +315,11 @@ class MiningState:
 
 def _code_hash(code: str) -> str:
     return hashlib.md5(code.strip().encode()).hexdigest()[:12]
+
+
+def _sanitize_name_suffix(s: str, max_len: int = 20) -> str:
+    """Strip non-alphanumeric/underscore chars to prevent path injection in filenames."""
+    return re.sub(r"[^a-zA-Z0-9_]", "", s)[:max_len]
 
 
 def _notify(message: str) -> None:
@@ -949,7 +955,7 @@ class AlphaMiner:
                             recipe = select_recipe(ft_hint, i, used_expr)
                             log.warning("LLM selected unknown recipe_id; falling back to %s", recipe.recipe_id)
                         spec = recipe.to_spec(
-                            name_suffix=str(selection.get("name_suffix") or ""),
+                            name_suffix=_sanitize_name_suffix(str(selection.get("name_suffix") or "")),
                             economic_hypothesis=str(selection.get("economic_hypothesis") or ""),
                             why_not_duplicate=str(selection.get("why_not_duplicate") or ""),
                         )
@@ -975,6 +981,16 @@ class AlphaMiner:
                 log.info("Duplicate code hash %s — skipping", h)
                 continue
 
+            # Pre-eval expression dedup: skip logically identical DSL formulas even
+            # if the generated Python wrapper differs (e.g. different variable names).
+            _compact_expr = ""
+            if spec is not None:
+                _raw_expr = (validation.canonical_expression if validation else None) or spec.expression
+                _compact_expr = re.sub(r"\s+", "", _raw_expr)
+                if _compact_expr and _compact_expr in self._state.seen_expressions:
+                    log.info("Duplicate canonical expression — skipping pre-eval")
+                    continue
+
             base_name = spec.name if spec else "llm"
             name = f"gen{generation}_{base_name}_{i:02d}_{h[:6]}"
             c = FactorCandidate(
@@ -993,6 +1009,8 @@ class AlphaMiner:
                 complexity_score=validation.complexity_score if validation else 0,
             )
             self._state.seen_hashes.append(h)
+            if _compact_expr:
+                self._state.seen_expressions.append(_compact_expr)
             yield c
 
     def _mutate_survivors(

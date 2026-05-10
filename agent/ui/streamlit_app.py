@@ -125,6 +125,23 @@ def _pid_running(pid: int | None) -> bool:
         return False
 
 
+def _is_miner_pid(pid: int | None) -> bool:
+    """Return True only if `pid` is a live process whose cmdline contains 'alpha_miner'."""
+    if not pid:
+        return False
+    try:
+        pid = int(pid)
+        os.kill(pid, 0)  # raises if process is gone
+    except (OSError, ValueError):
+        return False
+    # /proc is Linux-only; skip the cmdline check on Windows/macOS.
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\x00", b" ").decode(errors="replace")
+        return "alpha_miner" in cmdline
+    except Exception:
+        return True  # can't verify, allow the signal
+
+
 def _read_mining_ui_state() -> dict:
     if not MINING_UI_STATE.is_file():
         return {}
@@ -446,7 +463,10 @@ def _stream_assistant(messages: list, model: str, temperature: float, provider: 
                     yield token
     else:
         from openai import OpenAI
-        client = OpenAI(api_key=os.environ["OPENAI_API_KEY"].strip())
+        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is not set. Add it to .env or the environment.")
+        client = OpenAI(api_key=api_key)
         stream = client.chat.completions.create(
             model=model,
             messages=messages,
@@ -678,21 +698,25 @@ def main():
                 cmd.extend(["--backend", _backend, "--device", _device, "--provider", _ui_provider])
                 if st.session_state.get("sb_pipeline_return_horizon") == "same-day diagnostic":
                     cmd.append("--no-next-day")
-                with st.spinner("Running pipeline…"):
-                    proc = subprocess.run(
-                        cmd,
-                        cwd=str(ROOT),
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                    )
-                st.code(proc.stdout + ("\n" + proc.stderr if proc.stderr else ""), language="text")
-                if proc.returncode == 0:
-                    st.success("Pipeline finished OK.")
-                    st.session_state["pipeline_artifact_dir"] = str(_resolve_artifact_dir(artifact_dir))
-                else:
-                    st.error(f"Exit code {proc.returncode}")
+                with st.spinner("Running pipeline… (timeout 10 min)"):
+                    try:
+                        proc = subprocess.run(
+                            cmd,
+                            cwd=str(ROOT),
+                            capture_output=True,
+                            text=True,
+                            encoding="utf-8",
+                            errors="replace",
+                            timeout=600,
+                        )
+                        st.code(proc.stdout + ("\n" + proc.stderr if proc.stderr else ""), language="text")
+                        if proc.returncode == 0:
+                            st.success("Pipeline finished OK.")
+                            st.session_state["pipeline_artifact_dir"] = str(_resolve_artifact_dir(artifact_dir))
+                        else:
+                            st.error(f"Exit code {proc.returncode}")
+                    except subprocess.TimeoutExpired:
+                        st.error("Pipeline timed out after 10 minutes. Use the Alpha Miner for long runs.")
         st.divider()
         st.subheader("Batch analysis (multi-level parallel)")
         batch_factor_dir = st.text_input(
@@ -799,14 +823,18 @@ def main():
             if st.button("Stop current mining process", use_container_width=True):
                 proc.terminate()
                 st.warning("Stop signal sent.")
-        elif _pid_running(ui_state.get("pid")):
+        elif _is_miner_pid(ui_state.get("pid")):
             st.caption(f"Running PID from saved state: `{ui_state.get('pid')}`")
             if st.button("Stop saved mining process", use_container_width=True):
-                try:
-                    os.kill(int(ui_state["pid"]), signal.SIGTERM)
-                    st.warning("Stop signal sent to saved PID.")
-                except Exception as e:
-                    st.error(f"Could not stop saved PID: {e}")
+                pid = ui_state.get("pid")
+                if not _is_miner_pid(pid):
+                    st.warning("PID is no longer an alpha_miner process — stop skipped.")
+                else:
+                    try:
+                        os.kill(int(pid), signal.SIGTERM)
+                        st.warning("Stop signal sent to saved PID.")
+                    except Exception as e:
+                        st.error(f"Could not stop saved PID: {e}")
         else:
             if proc is not None:
                 rc = proc.poll()
@@ -849,6 +877,9 @@ def main():
                 encoding="utf-8",
                 errors="replace",
             )
+            # Keep the file handle in session state so it stays open while the
+            # process writes to it, and gets GC'd when the session ends.
+            st.session_state["alpha_mining_log_f"] = log_f
             st.session_state["alpha_mining_proc"] = proc
             st.session_state["mining_run_dir"] = str(run_dir)
             _write_mining_ui_state(run_dir, proc.pid)
@@ -890,6 +921,7 @@ def main():
                         encoding="utf-8",
                         errors="replace",
                     )
+                    st.session_state["alpha_mining_log_f"] = log_f
                     st.session_state["alpha_mining_proc"] = proc
                     st.session_state["mining_run_dir"] = str(run_dir)
                     _write_mining_ui_state(run_dir, proc.pid)
