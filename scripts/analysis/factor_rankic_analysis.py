@@ -790,6 +790,41 @@ class FactorRankICAnalyzer:
         quant_cols = [c for c in cols if c != 'LS']
         quant_cols_sorted = sorted(quant_cols, key=lambda x: int(x[1:]) if x.startswith('Q') and x[1:].isdigit() else 0)
 
+        # Plot all long-only quantile portfolios without the short leg.
+        if quant_cols_sorted:
+            plt.figure(figsize=(12, 6))
+            for c in quant_cols_sorted:
+                if c == 'Q1':
+                    color, linewidth, alpha, label = '#d62728', 1.8, 0.95, c
+                elif c == f"Q{len(quant_cols_sorted)}":
+                    color, linewidth, alpha, label = '#1f77b4', 2.0, 0.95, c
+                else:
+                    color, linewidth, alpha, label = '#999999', 1.0, 0.75, c
+                plt.plot(cum_df['date'], cum_df[c], color=color, linewidth=linewidth, alpha=alpha, label=label)
+            plt.title('Cumulative Return (Long-Only Decile Portfolios)', fontsize=13)
+            plt.xlabel('Date')
+            plt.ylabel('Cumulative Return')
+            plt.legend(ncol=2, fontsize=8)
+            plt.grid(True, alpha=0.3)
+            out_long_all = os.path.join(output_dir, f"{prefix}_decile_long_only_all.png")
+            plt.tight_layout()
+            plt.savefig(out_long_all, dpi=150)
+            plt.close()
+
+            qh = f"Q{len(quant_cols_sorted)}"
+            if qh in cum_df.columns:
+                plt.figure(figsize=(12, 6))
+                plt.plot(cum_df['date'], cum_df[qh], color='#1f77b4', linewidth=2.0, label=f'Long-only {qh}')
+                plt.title(f'Cumulative Return (Long-Only {qh})', fontsize=13)
+                plt.xlabel('Date')
+                plt.ylabel('Cumulative Return')
+                plt.legend()
+                plt.grid(True, alpha=0.3)
+                out_long_top = os.path.join(output_dir, f"{prefix}_decile_long_only_{qh}.png")
+                plt.tight_layout()
+                plt.savefig(out_long_top, dpi=150)
+                plt.close()
+
         # Plot all quantiles + LS
         plt.figure(figsize=(12, 6))
         for c in quant_cols_sorted:

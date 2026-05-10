@@ -32,7 +32,6 @@ def _now() -> str:
 @contextlib.contextmanager
 def _conn():
     """Open a connection, commit on clean exit, rollback on exception."""
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(str(DB_PATH), timeout=10)
     con.row_factory = sqlite3.Row
     try:
@@ -47,7 +46,9 @@ def _conn():
 
 def init_db() -> None:
     """Create the jobs table if it does not exist (idempotent)."""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with _conn() as con:
+        con.execute("PRAGMA journal_mode=WAL")
         con.execute("""
             CREATE TABLE IF NOT EXISTS jobs (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -63,6 +64,8 @@ def init_db() -> None:
                 run_id       TEXT    DEFAULT ''
             )
         """)
+        con.execute("CREATE INDEX IF NOT EXISTS idx_jobs_run_id ON jobs (run_id)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status  ON jobs (status)")
 
 
 def submit(job_type: str, params: dict, run_id: str = "") -> int:
@@ -157,6 +160,16 @@ def list_jobs(limit: int = 50) -> list[dict]:
     with _conn() as con:
         rows = con.execute(
             "SELECT * FROM jobs ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def list_jobs_for_run(run_id: str, limit: int = 12) -> list[dict]:
+    """Return jobs matching run_id, newest first — avoids full-table fetch."""
+    with _conn() as con:
+        rows = con.execute(
+            "SELECT * FROM jobs WHERE run_id = ? ORDER BY id DESC LIMIT ?",
+            (run_id, limit),
         ).fetchall()
         return [dict(r) for r in rows]
 

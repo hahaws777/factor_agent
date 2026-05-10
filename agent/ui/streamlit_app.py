@@ -483,12 +483,27 @@ def _render_backtest_artifacts(art: Path, title: str = "Backtest results", candi
                 _render_factor_formula(meta, prefix, compact=True)
 
     if pngs:
-        st.markdown("**Backtest images**")
-        cols = st.columns(2)
-        for i, png in enumerate(pngs):
-            prefix, meta = _factor_meta_for_path(png, lookup)
-            caption_name = str(meta.get("name") or meta.get("factor_name") or prefix)
-            cols[i % 2].image(str(png), caption=f"{png.name} · {caption_name}", width="stretch")
+        long_only_pngs = [p for p in pngs if "long_only" in p.name.lower()]
+        long_short_pngs = [
+            p for p in pngs
+            if ("_ls" in p.name.lower() or "long-short" in p.name.lower())
+            and p not in long_only_pngs
+        ]
+        other_pngs = [p for p in pngs if p not in long_only_pngs and p not in long_short_pngs]
+
+        def _render_png_grid(title: str, files: list[Path], expanded: bool = True) -> None:
+            if not files:
+                return
+            with st.expander(title, expanded=expanded):
+                cols = st.columns(2)
+                for i, png in enumerate(files):
+                    prefix, meta = _factor_meta_for_path(png, lookup)
+                    caption_name = str(meta.get("name") or meta.get("factor_name") or prefix)
+                    cols[i % 2].image(str(png), caption=f"{png.name} · {caption_name}", width="stretch")
+
+        _render_png_grid("Long-only decile images", long_only_pngs, expanded=True)
+        _render_png_grid("Long-short images", long_short_pngs, expanded=True)
+        _render_png_grid("Other backtest images", other_pngs, expanded=False)
 
     if lookup and (csvs or pngs):
         mapped = []
@@ -779,10 +794,9 @@ def _render_mining_run(run_dir: Path) -> None:
             st.code(_tail_text(log_path), language="text")
         return
 
-    try:
-        state = json.loads(cp.read_text(encoding="utf-8"))
-    except Exception as e:
-        st.warning(f"Could not read checkpoint: {e}")
+    state = _cached_checkpoint(str(cp))
+    if state is None:
+        st.warning("Could not read checkpoint.")
         return
 
     config = state.get("config", {})
@@ -918,6 +932,7 @@ def _render_mining_run(run_dir: Path) -> None:
                             run_id=run_dir.name,
                         )
                         st.session_state["mining_backtest_job_id"] = job_id
+                        _invalidate_job_caches()
                         st.success(f"Backtest queued as job `{job_id}`")
                     else:
                         st.error("job_queue not available — cannot submit backtest job.")
@@ -960,13 +975,67 @@ def _render_mining_run(run_dir: Path) -> None:
                     st.code(_tail_text(lp), language="text")
 
 
+@st.cache_data(ttl=2)
+def _cached_get_job(job_id: int) -> "dict | None":
+    if _jq is None:
+        return None
+    try:
+        return _jq.get_job(job_id)
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=2)
+def _cached_list_jobs(limit: int = 8) -> list:
+    if _jq is None:
+        return []
+    try:
+        return _jq.list_jobs(limit=limit)
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=2)
+def _cached_list_jobs_for_run(run_id: str, limit: int = 12) -> list:
+    if _jq is None:
+        return []
+    try:
+        return _jq.list_jobs_for_run(run_id, limit=limit)
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=10)
+def _cached_mining_run_dirs() -> list[str]:
+    """Cached filesystem scan — TTL 10s avoids rescanning on every rerun."""
+    return [str(p) for p in _mining_run_dirs()]
+
+
+@st.cache_data(ttl=5)
+def _cached_checkpoint(cp_str: str) -> "dict | None":
+    """Cache checkpoint.json parse — large JSON, only changes between generations."""
+    cp = Path(cp_str)
+    if not cp.is_file():
+        return None
+    try:
+        return json.loads(cp.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _invalidate_job_caches() -> None:
+    """Clear all job-related caches after a mutation (submit / cancel)."""
+    _cached_get_job.clear()
+    _cached_list_jobs.clear()
+    _cached_list_jobs_for_run.clear()
+
+
 def _render_job_card(job_id: int, artifact_key: str = "") -> None:
     """Show a compact inline status card for a queued job, plus a log tail."""
     if _jq is None or job_id is None:
         return
-    try:
-        job = _jq.get_job(job_id)
-    except Exception:
+    job = _cached_get_job(job_id)
+    if job is None:
         return
     if job is None:
         return
@@ -1002,6 +1071,7 @@ def _render_job_card(job_id: int, artifact_key: str = "") -> None:
         st.info(label)
         if st.button("Cancel", key=f"cancel_job_{job_id}"):
             _jq.cancel_job(job_id)
+            _invalidate_job_caches()
             st.rerun()
     elif status == "failed":
         st.error(f"Job `{job_id}` failed — {job.get('error') or 'see log below'}")
@@ -1020,9 +1090,8 @@ def _render_recent_jobs_sidebar() -> None:
     """Compact expander showing the 8 most recent jobs."""
     if _jq is None:
         return
-    try:
-        jobs = _jq.list_jobs(limit=8)
-    except Exception:
+    jobs = _cached_list_jobs(limit=8)
+    if not jobs:
         return
     if not jobs:
         return
@@ -1036,11 +1105,7 @@ def _render_recent_jobs_sidebar() -> None:
 def _jobs_for_run(run_id: str, limit: int = 12) -> list[dict]:
     if _jq is None or not run_id:
         return []
-    try:
-        jobs = _jq.list_jobs(limit=100)
-    except Exception:
-        return []
-    return [j for j in jobs if str(j.get("run_id") or "") == run_id][:limit]
+    return _cached_list_jobs_for_run(run_id, limit=limit)
 
 
 def _render_run_jobs(run_id: str) -> None:
@@ -1134,15 +1199,20 @@ def _render_alpha_mining_console(_w_max: int, default_data_pkl: str) -> None:
                 st.session_state["mining_job_id"] = job_id
                 st.session_state["mining_run_dir"] = str(run_dir)
                 _write_mining_ui_state(run_dir, ui_state.get("pid"))
+                _invalidate_job_caches()
+                _cached_mining_run_dirs.clear()
                 st.success(f"Mining queued as job `{job_id}` (run: {run_id})")
             else:
                 st.error("job_queue not available — cannot submit job.")
     with b2:
         if st.button("Refresh mining view", width="stretch"):
+            _cached_checkpoint.clear()
+            _cached_mining_run_dirs.clear()
+            _invalidate_job_caches()
             st.rerun()
     st.caption("Jobs run through the SQLite queue. Use each job card's Cancel button for queued/running work.")
 
-    run_dirs = _mining_run_dirs()
+    run_dirs = [Path(p) for p in _cached_mining_run_dirs()]
     if run_dirs:
         st.markdown("**Existing runs**")
         run_names = [d.name for d in run_dirs[:50]]
@@ -1174,6 +1244,7 @@ def _render_alpha_mining_console(_w_max: int, default_data_pkl: str) -> None:
                     st.session_state["mining_job_id"] = job_id
                     st.session_state["mining_run_dir"] = str(run_dir)
                     _write_mining_ui_state(run_dir, ui_state.get("pid"))
+                    _invalidate_job_caches()
                     st.success(f"Resume queued as job `{job_id}`")
                 else:
                     st.error("job_queue not available — cannot submit job.")
@@ -1260,9 +1331,9 @@ def main():
         if saved_run_dir is not None and saved_run_dir.is_dir():
             st.session_state["mining_run_dir"] = str(saved_run_dir)
         else:
-            latest_runs = _mining_run_dirs()
+            latest_runs = _cached_mining_run_dirs()
             if latest_runs:
-                st.session_state["mining_run_dir"] = str(latest_runs[0])
+                st.session_state["mining_run_dir"] = latest_runs[0]
 
     with st.sidebar:
         ui_view = st.radio(
@@ -1419,6 +1490,7 @@ def main():
                         {"cmd": cmd, "cwd": str(ROOT), "artifact_dir": artifact_dir},
                     )
                     st.session_state["pipeline_job_id"] = job_id
+                    _invalidate_job_caches()
                     st.success(f"Queued as job `{job_id}` — the worker will run it.")
                 else:
                     st.error("job_queue not available — cannot submit job.")
@@ -1503,6 +1575,7 @@ def main():
                     {"cmd": cmd, "cwd": str(ROOT), "artifact_dir": batch_out_dir},
                 )
                 st.session_state["batch_job_id"] = job_id
+                _invalidate_job_caches()
                 st.success(f"Queued as job `{job_id}` — the worker will run it.")
             else:
                 st.error("job_queue not available — cannot submit job.")
