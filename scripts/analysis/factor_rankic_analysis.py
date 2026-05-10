@@ -87,6 +87,98 @@ def _parallel_decile_calc(args):
     return (d, means.to_dict())
 
 
+def _is_blocked(series: pd.Series | None) -> pd.Series | bool:
+    """Treat explicit True as blocked; NaN/False are tradable for this flag."""
+    if series is None:
+        return False
+    return series.eq(True)
+
+
+def _normalize_equal_weight(ids) -> dict:
+    ids = list(dict.fromkeys(str(x) for x in ids))
+    if not ids:
+        return {}
+    w = 1.0 / len(ids)
+    return {sid: w for sid in ids}
+
+
+def _rebalance_one_bucket(prev_weights: dict, target_ids: list[str], tradable_buy: set[str], tradable_sell: set[str]) -> dict:
+    """
+    Rebalance one long-only decile with simple daily-bar execution constraints.
+
+    - New buys require tradable_buy membership.
+    - Exits require tradable_sell membership.
+    - Names that cannot be sold remain in the portfolio.
+    - Weights are equal-weighted after combining retained unsellable names and buyable target names.
+    """
+    prev_ids = set(prev_weights)
+    target_set = set(str(x) for x in target_ids)
+
+    retained = {sid for sid in prev_ids if sid in target_set or sid not in tradable_sell}
+    buyable_targets = {sid for sid in target_set if sid in tradable_buy}
+    final_ids = retained | buyable_targets
+    return _normalize_equal_weight(sorted(final_ids))
+
+
+def _stateful_decile_backtest(
+    data: pd.DataFrame,
+    factor_name: str,
+    n_bins: int,
+    transaction_cost_bps: float = 0.0,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Stateful decile backtest with basic execution feasibility:
+    cannot buy signal-day limit-up/suspended names; cannot sell signal-day
+    limit-down/suspended names, so those positions carry forward.
+    """
+    data = data.sort_values(["date", "order_book_id"]).copy()
+    holdings: dict[int, dict[str, float]] = {i: {} for i in range(n_bins)}
+    records = []
+    cost_per_unit = float(transaction_cost_bps or 0.0) / 10_000.0
+
+    for d, g in data.groupby("date", sort=True):
+        g = g.dropna(subset=[factor_name, "return"])
+        if g[factor_name].notna().sum() < n_bins:
+            continue
+        try:
+            bins = pd.qcut(g[factor_name], q=n_bins, labels=False, duplicates="drop")
+        except Exception:
+            continue
+        g = g.assign(bin=bins.astype(int))
+        g["order_book_id"] = g["order_book_id"].astype(str)
+
+        buy_blocked = _is_blocked(g.get("limit_up_flag")) | _is_blocked(g.get("suspended"))
+        sell_blocked = _is_blocked(g.get("limit_down_flag")) | _is_blocked(g.get("suspended"))
+        tradable_buy = set(g.loc[~buy_blocked, "order_book_id"])
+        tradable_sell = set(g.loc[~sell_blocked, "order_book_id"])
+        ret_map = g.set_index("order_book_id")["return"].to_dict()
+
+        rec = {"date": d}
+        for bin_id in sorted(g["bin"].dropna().unique()):
+            bin_id = int(bin_id)
+            target_ids = g.loc[g["bin"] == bin_id, "order_book_id"].tolist()
+            prev = holdings.get(bin_id, {})
+            new_weights = _rebalance_one_bucket(prev, target_ids, tradable_buy, tradable_sell)
+
+            gross_ret = sum(float(w) * float(ret_map.get(sid, 0.0) or 0.0) for sid, w in new_weights.items())
+            turnover = 0.5 * sum(abs(new_weights.get(sid, 0.0) - prev.get(sid, 0.0)) for sid in set(new_weights) | set(prev))
+            rec[bin_id] = gross_ret - turnover * cost_per_unit
+            holdings[bin_id] = new_weights
+        records.append(rec)
+
+    if not records:
+        raise ValueError("All dates failed to form tradable quantile portfolios; check factor distribution and filters.")
+
+    ret_tbl = pd.DataFrame(records).set_index("date").sort_index()
+    col_map = {c: f"Q{i + 1}" for i, c in enumerate(ret_tbl.columns)}
+    ret_tbl = ret_tbl.rename(columns=col_map)
+    q_low = "Q1"
+    q_high = f"Q{min(n_bins, len(ret_tbl.columns))}"
+    ret_tbl["LS"] = ret_tbl[q_high] - ret_tbl[q_low] if q_low in ret_tbl.columns and q_high in ret_tbl.columns else np.nan
+    cum_tbl = (1.0 + ret_tbl.fillna(0)).cumprod() - 1.0
+    return ret_tbl.reset_index(), cum_tbl.reset_index()
+
+
 def _torch_corr(x: "torch.Tensor", y: "torch.Tensor") -> float:
     """Compute Pearson correlation for two 1D tensors."""
     x = x.float()
@@ -504,7 +596,8 @@ class FactorRankICAnalyzer:
                          exclude_suspended=True,
                          use_next_day_return=True,
                          workers=None,
-                         transaction_cost_bps=0):
+                         transaction_cost_bps=0,
+                         realistic_execution=True):
         """
         Factor decile backtest (default 10 bins). Computes equal-weight group
         daily returns and long-short return (top_bin - bottom_bin).
@@ -514,9 +607,11 @@ class FactorRankICAnalyzer:
         n_bins              : number of quantile buckets (default 10)
         exclude_st / limit_up / limit_down / suspended : filter flags
         use_next_day_return : use T+1 return for realistic trade execution
-        transaction_cost_bps: one-way cost in basis points. Applied as 2× every day
-                              (i.e. assumes 100% daily turnover) — this is a conservative
-                              upper bound. Real turnover is lower; use as a stress test.
+        transaction_cost_bps: one-way cost in basis points.
+        realistic_execution: if True and use_next_day_return=True, model basic
+                             daily-bar execution feasibility: cannot buy signal-day
+                             limit-up/suspended names and cannot sell signal-day
+                             limit-down/suspended names; blocked exits carry forward.
 
         Results are stored in:
             self.backtest_daily_returns : DataFrame[date, Q1..Qn, LS]
@@ -531,30 +626,39 @@ class FactorRankICAnalyzer:
         if use_next_day_return:
             by_stock = data.groupby('order_book_id', observed=True)
             data['return'] = by_stock['close'].shift(-1) / data['close'] - 1.0
-            if exclude_limit_up or exclude_limit_down:
-                data['_next_luf'] = by_stock['limit_up_flag'].shift(-1)
-                data['_next_ldf'] = by_stock['limit_down_flag'].shift(-1)
         else:
             data['return'] = data.groupby('order_book_id', observed=True)['close'].pct_change(1, fill_method=None)
 
         if exclude_st:
             data = data[~data['ST'].astype(bool)]
-        if exclude_limit_up:
-            data = data[data['limit_up_flag'] != True]
-        if exclude_limit_down:
-            data = data[data['limit_down_flag'] != True]
-        if exclude_suspended:
-            data = data[~data['suspended'].astype(bool)]
-
-        if use_next_day_return:
-            if exclude_limit_up and '_next_luf' in data.columns:
-                data = data[data['_next_luf'] != True]
-            if exclude_limit_down and '_next_ldf' in data.columns:
-                data = data[data['_next_ldf'] != True]
+        if not (realistic_execution and use_next_day_return):
+            if exclude_limit_up:
+                data = data[data['limit_up_flag'] != True]
+            if exclude_limit_down:
+                data = data[data['limit_down_flag'] != True]
+            if exclude_suspended:
+                data = data[~data['suspended'].astype(bool)]
 
         data = data.dropna(subset=[self.factor_name, 'return'])
         if data.empty:
             raise ValueError("No valid data for backtest after filtering.")
+
+        if realistic_execution and use_next_day_return:
+            ret_tbl, cum_tbl = _stateful_decile_backtest(
+                data,
+                self.factor_name,
+                n_bins=n_bins,
+                transaction_cost_bps=transaction_cost_bps,
+            )
+            ret_tbl['date'] = pd.to_datetime(ret_tbl['date'])
+            cum_tbl['date'] = pd.to_datetime(cum_tbl['date'])
+            self.backtest_daily_returns = ret_tbl
+            self.backtest_cum_returns = cum_tbl
+            print("\nDecile backtest completed:")
+            print("  Execution model: stateful; no buy on limit-up/suspended; no sell on limit-down/suspended")
+            print(f"  Trading days: {ret_tbl['date'].nunique()}")
+            print(f"  Columns: {', '.join([c for c in ret_tbl.columns if c != 'date'])}")
+            return self
 
         # Quantile-bin within each date. Keep this lazy to avoid materialising
         # thousands of copied daily frames before workers consume them.
@@ -776,8 +880,11 @@ def main():
     parser.add_argument('--plot-output-dir', type=str, default=None,
                        help='Directory to save plots (default: backtest_plots)')
     parser.add_argument('--transaction-cost-bps', type=float, default=0,
-                       help='One-way transaction cost in basis points for L/S return (default: 0). '
-                            'Applied as 2x daily; assumes 100%% daily turnover — conservative upper bound.')
+                       help='One-way transaction cost in basis points for decile turnover (default: 0). '
+                            'In default stateful backtest this is applied to estimated turnover; '
+                            'in --simple-decile-bt mode it is applied as a daily round-trip stress cost.')
+    parser.add_argument('--simple-decile-bt', action='store_true',
+                       help='Use legacy independent daily decile means instead of stateful execution-aware backtest')
 
     args = parser.parse_args()
     
@@ -809,6 +916,7 @@ def main():
             use_next_day_return=not args.no_next_day_bt,
             workers=args.workers,
             transaction_cost_bps=args.transaction_cost_bps,
+            realistic_execution=not args.simple_decile_bt,
         ).save_backtest(output_dir=args.backtest_output_dir)
 
     if args.plot_backtest:
