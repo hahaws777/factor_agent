@@ -217,7 +217,8 @@ def load_decile_daily_factors(decile_dir: str, max_factors: int = 200) -> pd.Dat
         except Exception:
             continue
     if out is not None:
-        out = out.sort_values("date").fillna(0)
+        factor_cols = [c for c in out.columns if c != "date"]
+        out = out.sort_values("date").dropna(subset=factor_cols, how="all")
     return out
 
 
@@ -443,7 +444,7 @@ def main():
     market_npz = args.market_npz if args.market_npz and Path(args.market_npz).exists() else None
     market_csv = args.market_csv if args.market_csv and Path(args.market_csv).exists() else None
     if not market_npz and not market_csv and factors_npz_dir:
-        for p in [_root / "market_data_cpp.npz", Path("market_data_cpp.npz"), Path("e:/data/market_data_cpp.npz")]:
+        for p in [_root / "market_data_cpp.npz", Path("market_data_cpp.npz")]:
             if p.exists() and str(p).endswith(".npz"):
                 market_npz = str(p)
                 break

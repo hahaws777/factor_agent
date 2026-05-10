@@ -128,6 +128,12 @@ def extract_python_code(text: str) -> str:
     return text
 
 
+_SAFE_IMPORTS = frozenset({
+    "pandas", "numpy", "pathlib", "os", "os.path", "math", "datetime",
+    "collections", "itertools", "functools", "typing", "warnings", "re",
+    "scipy", "scipy.stats", "sklearn", "sklearn.preprocessing",
+})
+
 def validate_python_syntax(code: str) -> str | None:
     """Return error string if code has a syntax error, else None."""
     import ast
@@ -136,6 +142,27 @@ def validate_python_syntax(code: str) -> str | None:
         return None
     except SyntaxError as e:
         return f"SyntaxError at line {e.lineno}: {e.msg}"
+
+
+def validate_ast_safety(code: str) -> str | None:
+    """Return error string if code imports a module outside the safe list, else None."""
+    import ast
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                if top not in _SAFE_IMPORTS:
+                    return f"Forbidden import: {alias.name!r} (line {node.lineno})"
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            top = module.split(".")[0]
+            if top not in _SAFE_IMPORTS:
+                return f"Forbidden import: from {module!r} (line {node.lineno})"
+    return None
 
 
 def call_openai(user_message: str, model: str) -> str:
@@ -237,6 +264,11 @@ def main():
     if syntax_err:
         print(f"WARNING: generated code has a syntax error — {syntax_err}", file=sys.stderr)
         print("The file will still be saved so you can inspect and fix it manually.", file=sys.stderr)
+
+    safety_err = validate_ast_safety(code)
+    if safety_err:
+        print(f"WARNING: generated code contains a disallowed import — {safety_err}", file=sys.stderr)
+        print("Review carefully before executing.", file=sys.stderr)
 
     out_path.write_text(header + code, encoding="utf-8")
     print(f"Saved: {out_path.resolve()}", flush=True)

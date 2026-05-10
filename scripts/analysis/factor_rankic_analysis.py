@@ -8,7 +8,6 @@ Supports filtering ST stocks, limit-up/down stocks, and suspended stocks.
 import logging
 import pandas as pd
 import numpy as np
-import pickle
 import os
 import math
 from datetime import datetime
@@ -101,15 +100,23 @@ def _torch_corr(x: "torch.Tensor", y: "torch.Tensor") -> float:
     return float((torch.sum(xv * yv) / den).item())
 
 
-def _torch_rank_dense(x: "torch.Tensor") -> "torch.Tensor":
-    """
-    Dense rank via double argsort (no tie-average adjustment).
-    For most continuous factors/returns this is close to pandas rank.
-    """
-    order = torch.argsort(x)
-    rank = torch.empty_like(order, dtype=torch.float32)
-    rank[order] = torch.arange(1, x.numel() + 1, device=x.device, dtype=torch.float32)
-    return rank
+def _torch_rank_average(x: "torch.Tensor") -> "torch.Tensor":
+    """Average rank for ties — matches pandas rank(method='average')."""
+    n = x.numel()
+    order = torch.argsort(x, stable=True)
+    sorted_x = x[order]
+    new_group = torch.ones(n, dtype=torch.bool, device=x.device)
+    new_group[1:] = sorted_x[1:] != sorted_x[:-1]
+    group_id = torch.cumsum(new_group, dim=0) - 1
+    sorted_rank = torch.arange(1, n + 1, device=x.device, dtype=torch.float32)
+    group_rank_sum = torch.zeros(n, dtype=torch.float32, device=x.device)
+    group_count = torch.zeros(n, dtype=torch.float32, device=x.device)
+    group_rank_sum.scatter_add_(0, group_id, sorted_rank)
+    group_count.scatter_add_(0, group_id, torch.ones(n, device=x.device))
+    avg_rank = group_rank_sum / group_count.clamp(min=1)
+    result = torch.empty(n, dtype=torch.float32, device=x.device)
+    result[order] = avg_rank[group_id]
+    return result
 
 
 def _resolve_torch_device(device: str) -> str:
@@ -127,7 +134,8 @@ def _resolve_torch_device(device: str) -> str:
             return "cuda"
         return "cpu"
     if device.startswith("cuda") and not torch.cuda.is_available():
-        raise RuntimeError("CUDA device requested but torch.cuda.is_available() is False.")
+        log.warning("CUDA requested but unavailable; falling back to CPU.")
+        return "cpu"
     return device
 
 
@@ -170,8 +178,8 @@ def _torch_calc_rows_by_segments(
             x = tf[s:e]
             y = tr[s:e]
             ic_val = _torch_corr(x, y)
-            rx = _torch_rank_dense(x)
-            ry = _torch_rank_dense(y)
+            rx = _torch_rank_average(x)
+            ry = _torch_rank_average(y)
             rank_ic_val = _torch_corr(rx, ry)
             rows.append((d, n, ic_val, rank_ic_val))
     return rows
@@ -393,7 +401,7 @@ class FactorRankICAnalyzer:
             if workers is None or workers <= 1:
                 rows = [_parallel_ic_calc(it) for it in tasks]
             else:
-                max_workers = min(int(workers), max(1, multiprocessing.cpu_count()))
+                max_workers = min(int(workers), max(1, min(multiprocessing.cpu_count(), 16)))
                 with ProcessPoolExecutor(max_workers=max_workers) as ex:
                     rows = list(ex.map(_parallel_ic_calc, tasks, chunksize=8))
 
@@ -401,13 +409,12 @@ class FactorRankICAnalyzer:
 
         result = result[result['n_stocks'] >= MIN_STOCKS_PER_DAY].copy()
 
+        # Drop degenerate days (n<3 or fully constant factor/return) rather than
+        # filling NaN with 0, which would bias mean IC down and distort IR.
+        result = result[result['rank_ic'].notna() & result['ic'].notna()].copy()
+
         result['p_value'] = _corr_p_values(result['rank_ic'].values, result['n_stocks'].values)
         result['ic_p_value'] = _corr_p_values(result['ic'].values, result['n_stocks'].values)
-
-        # NaN IC days (torch path may produce NaN for degenerate slices) → 0
-        # so that downstream mean/std are computed over all valid days consistently.
-        result['ic'] = result['ic'].fillna(0)
-        result['rank_ic'] = result['rank_ic'].fillna(0)
 
         result['date'] = pd.to_datetime(result['date'])
         self.ic_results = result[['date', 'ic', 'rank_ic', 'p_value', 'ic_p_value', 'n_stocks']].sort_values('date')
@@ -496,7 +503,8 @@ class FactorRankICAnalyzer:
                          exclude_limit_down=True,
                          exclude_suspended=True,
                          use_next_day_return=True,
-                         workers=None):
+                         workers=None,
+                         transaction_cost_bps=0):
         """
         Factor decile backtest (default 10 bins). Computes equal-weight group
         daily returns and long-short return (top_bin - bottom_bin).
@@ -555,7 +563,7 @@ class FactorRankICAnalyzer:
         if workers is None or workers <= 1:
             rows = [_parallel_decile_calc(it) for it in tasks]
         else:
-            max_workers = min(int(workers), max(1, multiprocessing.cpu_count()))
+            max_workers = min(int(workers), max(1, min(multiprocessing.cpu_count(), 16)))
             with ProcessPoolExecutor(max_workers=max_workers) as ex:
                 rows = list(ex.map(_parallel_decile_calc, tasks, chunksize=8))
 
@@ -579,11 +587,13 @@ class FactorRankICAnalyzer:
             col_map[c] = f"Q{i+1}"
         ret_tbl = ret_tbl.rename(columns=col_map)
 
-        # Long-short: top quantile minus bottom quantile
+        # Long-short: top quantile minus bottom quantile, net of round-trip cost.
+        # transaction_cost_bps is one-way; *2 for a full round-trip (long top + short bottom).
         q_low = f"Q1"
         q_high = f"Q{min(n_bins, len(ret_tbl.columns))}"
+        daily_cost = 2.0 * transaction_cost_bps / 10_000
         if q_low in ret_tbl.columns and q_high in ret_tbl.columns:
-            ret_tbl['LS'] = ret_tbl[q_high] - ret_tbl[q_low]
+            ret_tbl['LS'] = ret_tbl[q_high] - ret_tbl[q_low] - daily_cost
         else:
             ret_tbl['LS'] = np.nan
 
