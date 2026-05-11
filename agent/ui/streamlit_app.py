@@ -441,6 +441,57 @@ def _render_factor_formula(meta: dict, prefix: str, *, compact: bool = False) ->
         st.caption(str(meta.get("economic_hypothesis")))
 
 
+def _write_long_only_backtest_pngs(cum_csv: Path, plot_dir: Path, prefix: str) -> list[Path]:
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    cum_df = pd.read_csv(cum_csv, parse_dates=["date"]).sort_values("date")
+    q_cols = sorted(
+        [c for c in cum_df.columns if c.startswith("Q") and c[1:].isdigit()],
+        key=lambda x: int(x[1:]),
+    )
+    if not q_cols:
+        return []
+
+    written: list[Path] = []
+
+    plt.figure(figsize=(12, 6))
+    for c in q_cols:
+        if c == "Q1":
+            color, linewidth, alpha, label = "#d62728", 1.8, 0.95, c
+        elif c == q_cols[-1]:
+            color, linewidth, alpha, label = "#1f77b4", 2.0, 0.95, c
+        else:
+            color, linewidth, alpha, label = "#999999", 1.0, 0.75, c
+        plt.plot(cum_df["date"], cum_df[c], color=color, linewidth=linewidth, alpha=alpha, label=label)
+    plt.title("Cumulative Return (Long-Only Decile Portfolios)", fontsize=13)
+    plt.xlabel("Date")
+    plt.ylabel("Cumulative Return")
+    plt.legend(ncol=2, fontsize=8)
+    plt.grid(True, alpha=0.3)
+    out_all = plot_dir / f"{prefix}_decile_long_only_all.png"
+    plt.tight_layout()
+    plt.savefig(out_all, dpi=150)
+    plt.close()
+    written.append(out_all)
+
+    top_q = q_cols[-1]
+    plt.figure(figsize=(12, 6))
+    plt.plot(cum_df["date"], cum_df[top_q], color="#1f77b4", linewidth=2.0, label=f"Long-only {top_q}")
+    plt.title(f"Cumulative Return (Long-Only {top_q})", fontsize=13)
+    plt.xlabel("Date")
+    plt.ylabel("Cumulative Return")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    out_top = plot_dir / f"{prefix}_decile_long_only_{top_q}.png"
+    plt.tight_layout()
+    plt.savefig(out_top, dpi=150)
+    plt.close()
+    written.append(out_top)
+    return written
+
+
 def _render_backtest_artifacts(art: Path, title: str = "Backtest results", candidates_df=None) -> None:
     import pandas as pd
 
@@ -504,6 +555,26 @@ def _render_backtest_artifacts(art: Path, title: str = "Backtest results", candi
         _render_png_grid("Long-only decile images", long_only_pngs, expanded=True)
         _render_png_grid("Long-short images", long_short_pngs, expanded=True)
         _render_png_grid("Other backtest images", other_pngs, expanded=False)
+
+        if not long_only_pngs and cum_csvs:
+            st.caption("No static long-only PNGs found for this backtest yet.")
+            selected_for_png = st.selectbox(
+                "Cumulative CSV for static long-only PNG generation",
+                [p.name for p in cum_csvs],
+                key=f"{art.name}_long_only_png_csv",
+            )
+            source_csv = next(p for p in cum_csvs if p.name == selected_for_png)
+            prefix = _backtest_factor_prefix(source_csv)
+            if st.button("Generate static long-only PNGs", key=f"{art.name}_make_long_only_png", width="stretch"):
+                try:
+                    written = _write_long_only_backtest_pngs(source_csv, plot_dir, prefix)
+                    if written:
+                        st.success(f"Generated {len(written)} long-only PNGs.")
+                        st.rerun()
+                    else:
+                        st.warning("No Q1..Qn columns found in the selected cumulative CSV.")
+                except Exception as e:
+                    st.error(f"Could not generate long-only PNGs: {e}")
 
     if lookup and (csvs or pngs):
         mapped = []
@@ -579,10 +650,11 @@ def _factor_artifact_rows(run_dir: Path, candidates_df=None) -> list[dict]:
     return rows
 
 
-def _render_factor_artifacts(run_dir: Path, candidates_df=None) -> None:
+def _render_factor_artifacts(run_dir: Path, candidates_df=None, rows: "list[dict] | None" = None) -> None:
     import pandas as pd
 
-    rows = _factor_artifact_rows(run_dir, candidates_df)
+    if rows is None:
+        rows = _factor_artifact_rows(run_dir, candidates_df)
     if not rows:
         st.info("No factor .py/.pkl/Rank IC artifacts found yet.")
         return
@@ -675,14 +747,15 @@ def _render_order_lane(title: str, tickets: list[str]) -> str:
     return f"<div class='order-lane'><h4>{_html_escape(title)}</h4>{body}</div>"
 
 
-def _render_calculation_pipeline_board(run_dir: Path, config: dict, candidates_df=None) -> None:
+def _render_calculation_pipeline_board(run_dir: Path, config: dict, candidates_df=None, factor_rows: "list[dict] | None" = None) -> None:
     st.markdown("**Alpha mining calculation board**")
 
     q_enabled = bool(config.get("pipeline_queue_enabled", True))
     outer_workers = int(config.get("outer_workers", 1) or 1)
     queue_size = int(config.get("pipeline_queue_size", 0) or max(2, outer_workers * 2))
     eval_workers = int(config.get("eval_workers", config.get("workers", 1)) or 1)
-    factor_rows = _factor_artifact_rows(run_dir, candidates_df)
+    if factor_rows is None:
+        factor_rows = _factor_artifact_rows(run_dir, candidates_df)
     jobs = _jobs_for_run(run_dir.name, limit=30)
 
     pending_jobs = [j for j in jobs if j.get("status") == "pending"]
@@ -810,10 +883,11 @@ def _render_mining_run(run_dir: Path) -> None:
     col3.metric("Best mean Rank IC", f"{state.get('best_mean_ric', 0):.4f}")
     col4.metric("Total evaluated", len(candidates))
 
-    _render_calculation_pipeline_board(run_dir, config, candidates_df=df)
+    factor_rows = _factor_artifact_rows(run_dir, candidates_df=df if not df.empty else None)
+    _render_calculation_pipeline_board(run_dir, config, candidates_df=df, factor_rows=factor_rows)
 
     if not df.empty:
-        _render_factor_artifacts(run_dir, candidates_df=df)
+        _render_factor_artifacts(run_dir, candidates_df=df, rows=factor_rows)
 
         if "error" in df.columns:
             error_s = df["error"].fillna("").astype(str)
@@ -1590,28 +1664,31 @@ def main():
             st.session_state.messages = []
             st.rerun()
 
-    # Must run AFTER sidebar: `pipeline_artifact_dir` is set when "Run pipeline" succeeds.
-    # If this block ran earlier in the script, the same rerun would still see stale session state.
-    art_key = st.session_state.get("pipeline_artifact_dir")
-    if art_key:
-        art_show = Path(art_key)
-        if art_show.is_dir():
-            st.divider()
-            _render_pipeline_artifacts(art_show)
+    # Must run AFTER sidebar so session state set by sidebar buttons is visible.
+    # Each block is gated to its own view — the other view's renders are completely
+    # skipped, which eliminates the main source of slowness: checkpoint.json parsing,
+    # glob scans, and CSV reads running on every chat interaction.
+    if ui_view == "Chat / Pipeline":
+        art_key = st.session_state.get("pipeline_artifact_dir")
+        if art_key:
+            art_show = Path(art_key)
+            if art_show.is_dir():
+                st.divider()
+                _render_pipeline_artifacts(art_show)
 
-    batch_key = st.session_state.get("batch_artifact_dir")
-    if batch_key:
-        batch_show = Path(batch_key)
-        if batch_show.is_dir():
-            st.divider()
-            _render_batch_artifacts(batch_show)
-
-    mining_key = st.session_state.get("mining_run_dir")
-    if mining_key:
-        mining_show = Path(mining_key)
-        if mining_show.is_dir():
-            st.divider()
-            _render_mining_run(mining_show)
+        batch_key = st.session_state.get("batch_artifact_dir")
+        if batch_key:
+            batch_show = Path(batch_key)
+            if batch_show.is_dir():
+                st.divider()
+                _render_batch_artifacts(batch_show)
+    else:
+        mining_key = st.session_state.get("mining_run_dir")
+        if mining_key:
+            mining_show = Path(mining_key)
+            if mining_show.is_dir():
+                st.divider()
+                _render_mining_run(mining_show)
 
 
 if __name__ == "__main__":
