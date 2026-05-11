@@ -536,9 +536,18 @@ def _render_backtest_png_sections(
             for i, png in enumerate(files):
                 cols[i % 2].image(str(png), caption=_caption_for_png(png), width="stretch")
 
-    _render_png_grid("Long-only decile images", long_only_pngs, expanded=True)
-    _render_png_grid("Long-short images", long_short_pngs, expanded=True)
-    _render_png_grid("Other backtest images", other_pngs, expanded=False)
+    render_images = st.toggle(
+        "Render backtest images",
+        value=False,
+        key=f"{key_prefix}_render_backtest_images",
+        help="Disable by default for smoother reruns; enable only when visual inspection is needed.",
+    )
+    if render_images:
+        _render_png_grid("Long-only decile images", long_only_pngs, expanded=True)
+        _render_png_grid("Long-short images", long_short_pngs, expanded=True)
+        _render_png_grid("Other backtest images", other_pngs, expanded=False)
+    elif pngs:
+        st.caption(f"Backtest image rendering is off ({len(pngs)} PNG files). Toggle on to view.")
 
     if not long_only_pngs and cum_csvs:
         st.caption("No static long-only PNGs found for this backtest yet.")
@@ -698,7 +707,16 @@ def _render_factor_artifacts(run_dir: Path, candidates_df=None, rows: "list[dict
         "factor", "family", "grade", "mean_rank_ic", "rank_ic_ir",
         "alpha_direction", "expression", "py", "pkl", "ic_csv",
     ]
-    st.dataframe(df_art[[c for c in show_cols if c in df_art.columns]], width="stretch", hide_index=True)
+    show_artifact_table = st.toggle(
+        "Render full artifact table",
+        value=False,
+        key=f"{run_dir.name}_render_artifact_table",
+        help="Large tables are hidden by default to reduce rerun latency.",
+    )
+    if show_artifact_table:
+        st.dataframe(df_art[[c for c in show_cols if c in df_art.columns]], width="stretch", hide_index=True)
+    else:
+        st.caption(f"Artifact table hidden for speed ({len(df_art)} rows). Toggle on to inspect.")
 
     selected = st.selectbox(
         "Open generated factor",
@@ -944,28 +962,38 @@ def _render_mining_run(run_dir: Path) -> None:
             families = ["all"] + sorted(x for x in df["family"].fillna("unknown").astype(str).unique() if x)
             family_filter = st.selectbox("Family filter", families, key=f"{run_dir.name}_family_filter")
 
-        df_show = df.copy()
-        if not show_rejected and "error" in df_show.columns:
-            df_show = df_show[df_show["error"].fillna("").astype(str) == ""]
-        if family_filter != "all" and "family" in df_show.columns:
-            df_show = df_show[df_show["family"].fillna("unknown").astype(str) == family_filter]
-        if "mean_rank_ic" in df_show.columns:
-            df_show["mean_rank_ic"] = pd.to_numeric(df_show["mean_rank_ic"], errors="coerce")
-            df_show = df_show.sort_values("mean_rank_ic", key=abs, ascending=False, na_position="last")
-        if "name" in df_show.columns:
-            df_show["survivor"] = df_show["name"].isin(survivors)
+        render_candidate_table = st.toggle(
+            "Render evaluated candidate table",
+            value=False,
+            key=f"{run_dir.name}_render_candidate_table",
+            help="Default off to reduce heavy DataFrame sorting/rendering on each rerun.",
+        )
 
-        show_cols = [
-            "survivor", "name", "generation", "origin", "family", "grade", "mean_rank_ic",
-            "rank_ic_ir", "rank_ic_win_rate", "recent_rank_ic", "train_rank_ic",
-            "validation_rank_ic", "test_rank_ic", "alpha_direction", "recommendation",
-            "expression", "max_similarity", "most_similar_to", "error",
-        ]
-        show_cols = [c for c in show_cols if c in df_show.columns]
-        st.markdown("**Evaluated factors and formulas**")
-        st.dataframe(df_show[show_cols].head(200), width="stretch", hide_index=True)
+        if render_candidate_table:
+            df_show = df.copy()
+            if not show_rejected and "error" in df_show.columns:
+                df_show = df_show[df_show["error"].fillna("").astype(str) == ""]
+            if family_filter != "all" and "family" in df_show.columns:
+                df_show = df_show[df_show["family"].fillna("unknown").astype(str) == family_filter]
+            if "mean_rank_ic" in df_show.columns:
+                df_show["mean_rank_ic"] = pd.to_numeric(df_show["mean_rank_ic"], errors="coerce")
+                df_show = df_show.sort_values("mean_rank_ic", key=abs, ascending=False, na_position="last")
+            if "name" in df_show.columns:
+                df_show["survivor"] = df_show["name"].isin(survivors)
 
-        detail_names = df_show["name"].astype(str).tolist() if "name" in df_show.columns else []
+            show_cols = [
+                "survivor", "name", "generation", "origin", "family", "grade", "mean_rank_ic",
+                "rank_ic_ir", "rank_ic_win_rate", "recent_rank_ic", "train_rank_ic",
+                "validation_rank_ic", "test_rank_ic", "alpha_direction", "recommendation",
+                "expression", "max_similarity", "most_similar_to", "error",
+            ]
+            show_cols = [c for c in show_cols if c in df_show.columns]
+            st.markdown("**Evaluated factors and formulas**")
+            st.dataframe(df_show[show_cols].head(200), width="stretch", hide_index=True)
+            detail_names = df_show["name"].astype(str).tolist() if "name" in df_show.columns else []
+        else:
+            st.caption(f"Candidate table hidden for speed ({len(df)} rows). Toggle on to inspect.")
+            detail_names = df["name"].astype(str).tolist() if "name" in df.columns else []
         if detail_names:
             selected = st.selectbox("Inspect one factor", detail_names, key=f"{run_dir.name}_factor_detail")
             row = df[df["name"].astype(str) == selected].iloc[0].to_dict()
@@ -1237,7 +1265,7 @@ def _render_chat_jobs_panel() -> None:
     import pandas as pd
 
     jobs = _cached_list_jobs(limit=50)
-    with st.expander("Jobs", expanded=True):
+    with st.expander("Jobs", expanded=False):
         top_left, top_right = st.columns([1, 1])
         with top_left:
             st.caption("Queued, running, and completed work from the local SQLite job queue.")
@@ -1245,9 +1273,18 @@ def _render_chat_jobs_panel() -> None:
             if st.button("Refresh jobs", key="chat_jobs_refresh", width="stretch"):
                 _invalidate_job_caches()
                 st.rerun()
+        render_jobs_table = st.toggle(
+            "Render jobs table",
+            value=False,
+            key="chat_jobs_render_table",
+            help="Default off to keep chat interactions responsive.",
+        )
 
         if not jobs:
             st.info("No jobs found yet.")
+            return
+        if not render_jobs_table:
+            st.caption(f"Jobs table hidden for speed ({len(jobs)} rows cached). Toggle on to inspect.")
             return
 
         job_types = sorted({str(j.get("job_type") or "unknown") for j in jobs})
@@ -1314,7 +1351,7 @@ def _render_run_jobs(run_id: str) -> None:
         return
     import pandas as pd
 
-    with st.expander("Jobs and logs for this run", expanded=True):
+    with st.expander("Jobs and logs for this run", expanded=False):
         df = pd.DataFrame(jobs)[["id", "job_type", "status", "created_at", "finished_at", "error"]]
         df.columns = ["#", "type", "status", "submitted", "finished", "error"]
         st.dataframe(df, width="stretch", hide_index=True)
