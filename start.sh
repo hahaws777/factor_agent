@@ -75,7 +75,7 @@ tmux send-keys -t "$SESSION:0" \
 # Pane 1: Streamlit (split right)
 tmux split-window -t "$SESSION:0" -h
 tmux send-keys -t "$SESSION:0.1" \
-    "cd '$ROOT' && echo '=== Streamlit UI ===' && '$STREAMLIT' run agent/ui/streamlit_app.py --server.port $STREAMLIT_PORT" Enter
+    "cd '$ROOT' && echo '=== Streamlit UI ===' && '$STREAMLIT' run agent/ui/streamlit_app.py --server.port $STREAMLIT_PORT --server.fileWatcherType none --server.runOnSave false" Enter
 
 # Sensible pane titles
 tmux select-pane -t "$SESSION:0.0" -T "worker"

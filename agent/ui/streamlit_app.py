@@ -53,6 +53,7 @@ DOTENV = ROOT / ".env"
 MINING_DIR = ROOT / "agent_runs" / "mining"
 MINING_UI_STATE = MINING_DIR / "ui_state.json"
 JOB_LOG_DIR = ROOT / "agent_runs" / "job_logs"
+DEFAULT_CHAT_RENDER_LIMIT = 30
 
 
 def _load_dotenv() -> None:
@@ -178,11 +179,19 @@ def _resolve_existing_path(raw: str) -> Path:
     return p
 
 
-def _tail_text(path: Path, max_lines: int = 160) -> str:
+def _tail_text(path: Path, max_lines: int = 160, max_bytes: int = 256 * 1024) -> str:
     if not path.is_file():
         return ""
     try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        with path.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            read_bytes = min(size, int(max_bytes))
+            if read_bytes <= 0:
+                return ""
+            f.seek(size - read_bytes)
+            buf = f.read(read_bytes)
+        lines = buf.decode("utf-8", errors="replace").splitlines()
     except Exception as e:
         return f"Could not read log: {e}"
     return "\n".join(lines[-max_lines:])
@@ -312,18 +321,21 @@ def _render_pipeline_artifacts(art: Path) -> None:
             with st.expander("Rank IC table (first 200 rows)"):
                 st.dataframe(ic_df.head(200), width="stretch")
 
-    plot_dir = art / "backtest_plots"
-    if plot_dir.is_dir():
-        pngs = sorted(plot_dir.glob("*.png"))
-        if pngs:
-            st.markdown("**Decile backtest plots**")
-            cols = st.columns(2)
-            for i, png in enumerate(pngs):
-                cols[i % 2].image(str(png), caption=png.name, width="stretch")
-
     bt = art / "backtest_results"
+    csvs = sorted(bt.glob("*.csv")) if bt.is_dir() else []
+    cum_csvs = [p for p in csvs if "cum" in p.name.lower()]
+    plot_dir = art / "backtest_plots"
+    pngs = sorted(plot_dir.glob("*.png")) if plot_dir.is_dir() else []
+    if pngs or cum_csvs:
+        st.markdown("**Decile backtest plots**")
+        _render_backtest_png_sections(
+            plot_dir=plot_dir,
+            pngs=pngs,
+            cum_csvs=cum_csvs,
+            key_prefix=f"{art.name}_pipeline",
+        )
+
     if bt.is_dir():
-        csvs = sorted(bt.glob("*.csv"))
         if csvs:
             with st.expander("Backtest CSV paths"):
                 for c in csvs:
@@ -492,6 +504,63 @@ def _write_long_only_backtest_pngs(cum_csv: Path, plot_dir: Path, prefix: str) -
     return written
 
 
+def _render_backtest_png_sections(
+    *,
+    plot_dir: Path,
+    pngs: list[Path],
+    cum_csvs: list[Path],
+    key_prefix: str,
+    lookup: dict[str, dict] | None = None,
+) -> None:
+    lookup = lookup or {}
+    long_only_pngs = [p for p in pngs if "long_only" in p.name.lower()]
+    long_short_pngs = [
+        p for p in pngs
+        if ("_ls" in p.name.lower() or "long-short" in p.name.lower())
+        and p not in long_only_pngs
+    ]
+    other_pngs = [p for p in pngs if p not in long_only_pngs and p not in long_short_pngs]
+
+    def _caption_for_png(png: Path) -> str:
+        if lookup:
+            prefix, meta = _factor_meta_for_path(png, lookup)
+            caption_name = str(meta.get("name") or meta.get("factor_name") or prefix)
+            return f"{png.name} · {caption_name}"
+        return png.name
+
+    def _render_png_grid(title: str, files: list[Path], expanded: bool = True) -> None:
+        if not files:
+            return
+        with st.expander(title, expanded=expanded):
+            cols = st.columns(2)
+            for i, png in enumerate(files):
+                cols[i % 2].image(str(png), caption=_caption_for_png(png), width="stretch")
+
+    _render_png_grid("Long-only decile images", long_only_pngs, expanded=True)
+    _render_png_grid("Long-short images", long_short_pngs, expanded=True)
+    _render_png_grid("Other backtest images", other_pngs, expanded=False)
+
+    if not long_only_pngs and cum_csvs:
+        st.caption("No static long-only PNGs found for this backtest yet.")
+        selected_for_png = st.selectbox(
+            "Cumulative CSV for static long-only PNG generation",
+            [p.name for p in cum_csvs],
+            key=f"{key_prefix}_long_only_png_csv",
+        )
+        source_csv = next(p for p in cum_csvs if p.name == selected_for_png)
+        prefix = _backtest_factor_prefix(source_csv)
+        if st.button("Generate static long-only PNGs", key=f"{key_prefix}_make_long_only_png", width="stretch"):
+            try:
+                written = _write_long_only_backtest_pngs(source_csv, plot_dir, prefix)
+                if written:
+                    st.success(f"Generated {len(written)} long-only PNGs.")
+                    st.rerun()
+                else:
+                    st.warning("No Q1..Qn columns found in the selected cumulative CSV.")
+            except Exception as e:
+                st.error(f"Could not generate long-only PNGs: {e}")
+
+
 def _render_backtest_artifacts(art: Path, title: str = "Backtest results", candidates_df=None) -> None:
     import pandas as pd
 
@@ -533,48 +602,14 @@ def _render_backtest_artifacts(art: Path, title: str = "Backtest results", candi
                 st.text(str(p.relative_to(ROOT)) if p.is_relative_to(ROOT) else str(p))
                 _render_factor_formula(meta, prefix, compact=True)
 
-    if pngs:
-        long_only_pngs = [p for p in pngs if "long_only" in p.name.lower()]
-        long_short_pngs = [
-            p for p in pngs
-            if ("_ls" in p.name.lower() or "long-short" in p.name.lower())
-            and p not in long_only_pngs
-        ]
-        other_pngs = [p for p in pngs if p not in long_only_pngs and p not in long_short_pngs]
-
-        def _render_png_grid(title: str, files: list[Path], expanded: bool = True) -> None:
-            if not files:
-                return
-            with st.expander(title, expanded=expanded):
-                cols = st.columns(2)
-                for i, png in enumerate(files):
-                    prefix, meta = _factor_meta_for_path(png, lookup)
-                    caption_name = str(meta.get("name") or meta.get("factor_name") or prefix)
-                    cols[i % 2].image(str(png), caption=f"{png.name} · {caption_name}", width="stretch")
-
-        _render_png_grid("Long-only decile images", long_only_pngs, expanded=True)
-        _render_png_grid("Long-short images", long_short_pngs, expanded=True)
-        _render_png_grid("Other backtest images", other_pngs, expanded=False)
-
-        if not long_only_pngs and cum_csvs:
-            st.caption("No static long-only PNGs found for this backtest yet.")
-            selected_for_png = st.selectbox(
-                "Cumulative CSV for static long-only PNG generation",
-                [p.name for p in cum_csvs],
-                key=f"{art.name}_long_only_png_csv",
-            )
-            source_csv = next(p for p in cum_csvs if p.name == selected_for_png)
-            prefix = _backtest_factor_prefix(source_csv)
-            if st.button("Generate static long-only PNGs", key=f"{art.name}_make_long_only_png", width="stretch"):
-                try:
-                    written = _write_long_only_backtest_pngs(source_csv, plot_dir, prefix)
-                    if written:
-                        st.success(f"Generated {len(written)} long-only PNGs.")
-                        st.rerun()
-                    else:
-                        st.warning("No Q1..Qn columns found in the selected cumulative CSV.")
-                except Exception as e:
-                    st.error(f"Could not generate long-only PNGs: {e}")
+    if pngs or cum_csvs:
+        _render_backtest_png_sections(
+            plot_dir=plot_dir,
+            pngs=pngs,
+            cum_csvs=cum_csvs,
+            key_prefix=art.name,
+            lookup=lookup,
+        )
 
     if lookup and (csvs or pngs):
         mapped = []
@@ -633,8 +668,6 @@ def _factor_artifact_rows(run_dir: Path, candidates_df=None) -> list[dict]:
         pkl_path = _resolve_existing_path(str(meta.get("pkl_path") or factors_dir / f"{name}.pkl"))
         ic_path = _resolve_existing_path(str(meta.get("ic_csv_path") or ic_dir / f"{name}_rankic.csv"))
         expression = str(meta.get("expression") or meta.get("canonical_expression") or "").strip()
-        if not expression and py_path.is_file():
-            expression = _extract_factor_expression_from_py(py_path)
         rows.append({
             "factor": name,
             "family": meta.get("family") or "",
@@ -673,10 +706,13 @@ def _render_factor_artifacts(run_dir: Path, candidates_df=None, rows: "list[dict
         key=f"{run_dir.name}_artifact_factor_select",
     )
     row = df_art[df_art["factor"].astype(str) == selected].iloc[0].to_dict()
-    st.markdown(f"**DSL formula for `{selected}`**")
-    st.code(str(row.get("expression") or ""), language="text")
-
+    selected_expr = str(row.get("expression") or "")
     py_path = ROOT / str(row.get("py") or "")
+    if not selected_expr and py_path.is_file():
+        selected_expr = _extract_factor_expression_from_py(py_path)
+    st.markdown(f"**DSL formula for `{selected}`**")
+    st.code(selected_expr, language="text")
+
     if py_path.is_file():
         with st.expander("Generated Python module"):
             st.code(py_path.read_text(encoding="utf-8", errors="replace")[:20000], language="python")
@@ -1111,8 +1147,6 @@ def _render_job_card(job_id: int, artifact_key: str = "") -> None:
     job = _cached_get_job(job_id)
     if job is None:
         return
-    if job is None:
-        return
 
     status = job["status"]
     elapsed = ""
@@ -1174,6 +1208,98 @@ def _render_recent_jobs_sidebar() -> None:
         df = pd.DataFrame(jobs)[["id", "job_type", "status", "run_id", "created_at"]]
         df.columns = ["#", "type", "status", "run_id", "submitted"]
         st.dataframe(df, width="stretch", hide_index=True)
+
+
+def _job_params(job: dict) -> dict:
+    try:
+        return json.loads(job.get("params_json") or "{}")
+    except Exception:
+        return {}
+
+
+def _artifact_key_for_job(job: dict) -> str:
+    job_type = str(job.get("job_type") or "")
+    if job_type == "pipeline":
+        return "pipeline_artifact_dir"
+    if job_type == "batch_analysis":
+        return "batch_artifact_dir"
+    if job_type in {"mining_start", "mining_resume", "factor_backtest"}:
+        return "mining_run_dir"
+    return ""
+
+
+def _render_chat_jobs_panel() -> None:
+    """Main-area job queue view for Chat / Pipeline so refreshes do not hide jobs."""
+    if _jq is None:
+        st.info("Job queue is not available in this environment.")
+        return
+
+    import pandas as pd
+
+    jobs = _cached_list_jobs(limit=50)
+    with st.expander("Jobs", expanded=True):
+        top_left, top_right = st.columns([1, 1])
+        with top_left:
+            st.caption("Queued, running, and completed work from the local SQLite job queue.")
+        with top_right:
+            if st.button("Refresh jobs", key="chat_jobs_refresh", width="stretch"):
+                _invalidate_job_caches()
+                st.rerun()
+
+        if not jobs:
+            st.info("No jobs found yet.")
+            return
+
+        job_types = sorted({str(j.get("job_type") or "unknown") for j in jobs})
+        selected_types = st.multiselect(
+            "Job types",
+            job_types,
+            default=job_types,
+            key="chat_jobs_type_filter",
+        )
+        shown_jobs = [j for j in jobs if str(j.get("job_type") or "unknown") in set(selected_types)]
+        if not shown_jobs:
+            st.info("No jobs match the selected filters.")
+            return
+
+        status_counts = {}
+        for job in shown_jobs:
+            status = str(job.get("status") or "unknown")
+            status_counts[status] = status_counts.get(status, 0) + 1
+        metric_cols = st.columns(4)
+        for i, status in enumerate(["pending", "running", "success", "failed"]):
+            metric_cols[i].metric(status.title(), status_counts.get(status, 0))
+
+        rows = []
+        for job in shown_jobs:
+            params = _job_params(job)
+            rows.append({
+                "#": job.get("id"),
+                "type": job.get("job_type"),
+                "status": job.get("status"),
+                "run_id": job.get("run_id") or params.get("run_id") or "",
+                "artifact": params.get("artifact_dir") or "",
+                "submitted": job.get("created_at") or "",
+                "finished": job.get("finished_at") or "",
+                "error": job.get("error") or "",
+            })
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+        selected_job_id = st.selectbox(
+            "Inspect job",
+            [int(j["id"]) for j in shown_jobs],
+            format_func=lambda jid: next(
+                (
+                    f"job {jid} · {j.get('job_type')} · {j.get('status')}"
+                    for j in shown_jobs
+                    if int(j["id"]) == int(jid)
+                ),
+                f"job {jid}",
+            ),
+            key="chat_jobs_inspect",
+        )
+        selected_job = next((j for j in shown_jobs if int(j["id"]) == int(selected_job_id)), {})
+        _render_job_card(int(selected_job_id), artifact_key=_artifact_key_for_job(selected_job))
 
 
 def _jobs_for_run(run_id: str, limit: int = 12) -> list[dict]:
@@ -1326,6 +1452,32 @@ def _render_alpha_mining_console(_w_max: int, default_data_pkl: str) -> None:
         st.caption("No mining runs found.")
 
 
+@st.cache_resource
+def _init_db_once() -> None:
+    """Run once per server process — opens SQLite, sets WAL, creates table/indexes."""
+    if _jq is not None:
+        try:
+            _jq.init_db()
+        except Exception:
+            pass
+
+
+@st.cache_resource
+def _worker_counts() -> tuple[int, int]:
+    """Cache cpu_count so multiprocessing.cpu_count() is not called on every rerun."""
+    nc = int(multiprocessing.cpu_count() or 4)
+    return min(32, max(4, nc)), max(1, min(8, nc))
+
+
+@st.cache_resource
+def _ensure_dirs() -> Path:
+    """Create persistent output dirs once per server start."""
+    gen = ROOT / "generated_factors"
+    gen.mkdir(parents=True, exist_ok=True)
+    MINING_DIR.mkdir(parents=True, exist_ok=True)
+    return gen
+
+
 def _stream_assistant(messages: list, model: str, temperature: float, provider: str = "openai"):
     if provider == "anthropic":
         from anthropic import Anthropic
@@ -1360,6 +1512,192 @@ def _stream_assistant(messages: list, model: str, temperature: float, provider: 
                 yield token
 
 
+def _render_chat_pipeline_sidebar(gen_dir: Path, last_code, _w_max: int, _w_default: int) -> None:
+    """Sidebar content that is only relevant in Chat / Pipeline view."""
+    st.divider()
+    st.subheader("Pipeline (optional)")
+    data_pkl = st.text_input("Market pickle", value="data.pkl", key="sb_data")
+    artifact_dir = st.text_input(
+        "Artifact dir (under project root)",
+        value=st.session_state.artifact_default,
+        key="sb_art",
+    )
+    st.selectbox(
+        "Rank IC backend",
+        ["pandas", "torch"],
+        key="sb_pipeline_backend",
+        help="pandas: default CPU path; torch: supports CUDA/CPU device selection.",
+    )
+    st.text_input(
+        "Torch device",
+        value="auto",
+        key="sb_pipeline_device",
+        help="Used when backend=torch. Example: auto / cuda / cuda:0 / cpu",
+    )
+    st.slider(
+        "Parallel workers (Level-2: per-day IC/decile)",
+        min_value=1,
+        max_value=_w_max,
+        value=_w_default,
+        key="sb_pipeline_workers",
+        help="Per-trading-day IC/decile tasks run in a process pool when >1. Factor pickle step stays single-process.",
+    )
+    st.selectbox(
+        "Rank IC return horizon",
+        ["next-day forward", "same-day diagnostic"],
+        key="sb_pipeline_return_horizon",
+        help="Default is T signal vs T+1 return. Same-day is only for diagnostics.",
+    )
+    st.divider()
+    st.subheader("Export & run")
+    save_name = st.text_input("Save as (.py)", value=st.session_state.save_stub, key="sb_save")
+    save_path = gen_dir / save_name if save_name.endswith(".py") else gen_dir / f"{save_name}.py"
+    st.caption("Latest extractable `compute_factor_df` module is used for save/run.")
+    model = st.session_state.sb_model
+    if st.button("Save latest code → generated_factors", width="stretch", disabled=not last_code):
+        hdr = (
+            f"# Saved from Factor Agent UI — {datetime.now().isoformat(timespec='seconds')}\n"
+            f"# Model: {model}\n\n"
+        )
+        save_path.write_text(hdr + last_code, encoding="utf-8")
+        st.success(f"Wrote {save_path.relative_to(ROOT)}")
+
+    if st.button("Run pipeline (pickle + Rank IC + backtest + plots)", width="stretch"):
+        if not last_code:
+            st.warning("No `compute_factor_df` in recent assistant replies.")
+        else:
+            hdr = (
+                f"# Saved from Factor Agent UI — {datetime.now().isoformat(timespec='seconds')}\n"
+                f"# Model: {model}\n\n"
+            )
+            save_path.write_text(hdr + last_code, encoding="utf-8")
+            pipe = AGENT_DIR / "factor_agent_pipeline.py"
+            cmd = [
+                sys.executable,
+                str(pipe),
+                "--skip-generate",
+                str(save_path),
+                "--data",
+                data_pkl,
+                "--artifact-dir",
+                artifact_dir,
+            ]
+            _workers = int(st.session_state.get("sb_pipeline_workers", _w_default))
+            if _workers > 1:
+                cmd.extend(["--workers", str(_workers)])
+            _backend = str(st.session_state.get("sb_pipeline_backend", "pandas"))
+            _device = str(st.session_state.get("sb_pipeline_device", "auto")).strip() or "auto"
+            _ui_provider = str(st.session_state.get("sb_provider", "openai"))
+            cmd.extend(["--backend", _backend, "--device", _device, "--provider", _ui_provider])
+            if st.session_state.get("sb_pipeline_return_horizon") == "same-day diagnostic":
+                cmd.append("--no-next-day")
+            if _jq is not None:
+                job_id = _jq.submit(
+                    "pipeline",
+                    {"cmd": cmd, "cwd": str(ROOT), "artifact_dir": artifact_dir},
+                )
+                st.session_state["pipeline_job_id"] = job_id
+                _invalidate_job_caches()
+                st.success(f"Queued as job `{job_id}` — the worker will run it.")
+            else:
+                st.error("job_queue not available — cannot submit job.")
+
+    _render_job_card(
+        st.session_state.get("pipeline_job_id"),
+        artifact_key="pipeline_artifact_dir",
+    )
+    st.divider()
+    st.subheader("Batch analysis (multi-level parallel)")
+    batch_factor_dir = st.text_input(
+        "Factor dir",
+        value="factors_by_type",
+        key="batch_factor_dir",
+    )
+    batch_out_dir = st.text_input(
+        "Batch output dir",
+        value="rankic_batch_results",
+        key="batch_out_dir",
+    )
+    st.selectbox(
+        "Batch backend",
+        ["pandas", "torch"],
+        key="batch_backend",
+        help="Applied to each factor's Rank IC computation.",
+    )
+    st.text_input(
+        "Batch torch device",
+        value="auto",
+        key="batch_device",
+    )
+    st.slider(
+        "Factor workers (Level-1: cross-factor parallel)",
+        min_value=1,
+        max_value=_w_max,
+        value=max(1, min(4, _w_default)),
+        key="batch_factor_workers",
+        help="Run multiple factor files in parallel.",
+    )
+    st.slider(
+        "IC workers (Level-2: per-factor/day parallel)",
+        min_value=1,
+        max_value=_w_max,
+        value=_w_default,
+        key="batch_ic_workers",
+        help="Workers used inside each factor for per-day IC/decile tasks.",
+    )
+    st.selectbox(
+        "Batch return horizon",
+        ["next-day forward", "same-day diagnostic"],
+        key="batch_return_horizon",
+        help="Default is T signal vs T+1 return. Same-day is only for diagnostics.",
+    )
+    if st.button("Run batch analysis", width="stretch"):
+        batch_script = ROOT / "scripts" / "analysis" / "batch_factor_analysis.py"
+        _factor_workers = int(st.session_state.get("batch_factor_workers", 1))
+        _ic_workers = int(st.session_state.get("batch_ic_workers", _w_default))
+        _batch_backend = str(st.session_state.get("batch_backend", "pandas"))
+        _batch_device = str(st.session_state.get("batch_device", "auto")).strip() or "auto"
+        cmd = [
+            sys.executable,
+            str(batch_script),
+            batch_factor_dir,
+            "--output-dir",
+            batch_out_dir,
+            "--data",
+            data_pkl,
+            "--factor-workers",
+            str(_factor_workers),
+            "--ic-workers",
+            str(_ic_workers),
+            "--backend",
+            _batch_backend,
+            "--device",
+            _batch_device,
+        ]
+        if st.session_state.get("batch_return_horizon") == "same-day diagnostic":
+            cmd.append("--no-next-day")
+        if _jq is not None:
+            job_id = _jq.submit(
+                "batch_analysis",
+                {"cmd": cmd, "cwd": str(ROOT), "artifact_dir": batch_out_dir},
+            )
+            st.session_state["batch_job_id"] = job_id
+            _invalidate_job_caches()
+            st.success(f"Queued as job `{job_id}` — the worker will run it.")
+        else:
+            st.error("job_queue not available — cannot submit job.")
+
+    _render_job_card(
+        st.session_state.get("batch_job_id"),
+        artifact_key="batch_artifact_dir",
+    )
+    _render_recent_jobs_sidebar()
+    st.divider()
+    if st.button("New conversation", width="stretch"):
+        st.session_state.messages = []
+        st.rerun()
+
+
 def main():
     st.set_page_config(
         page_title="Factor Agent",
@@ -1368,16 +1706,15 @@ def main():
         initial_sidebar_state="expanded",
     )
     _inject_theme_css()
-    if _jq is not None:
-        try:
-            _jq.init_db()
-        except Exception:
-            pass
+    _init_db_once()
 
     ok, err = _bootstrap_api_key()
     if not ok:
         st.error(err)
         st.stop()
+
+    gen_dir = _ensure_dirs()
+    _w_max, _w_default = _worker_counts()
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
@@ -1391,12 +1728,10 @@ def main():
         st.session_state.sb_provider = "anthropic" if (has_anthropic and not has_openai) else "openai"
     if "sb_model" not in st.session_state:
         st.session_state.sb_model = "gpt-4.1"
+    if "chat_render_limit" not in st.session_state:
+        st.session_state.chat_render_limit = DEFAULT_CHAT_RENDER_LIMIT
     st.title("Factor Agent")
     st.caption("Chat · generate `compute_factor_df()` · optional Rank IC / decile backtest")
-
-    gen_dir = ROOT / "generated_factors"
-    gen_dir.mkdir(parents=True, exist_ok=True)
-    MINING_DIR.mkdir(parents=True, exist_ok=True)
 
     if "mining_run_dir" not in st.session_state:
         ui_state = _read_mining_ui_state()
@@ -1416,12 +1751,17 @@ def main():
             key="ui_view",
         )
 
-    _nc = int(multiprocessing.cpu_count() or 4)
-    _w_max = min(32, max(4, _nc))
-    _w_default = max(1, min(8, _nc))
-
     if ui_view == "Chat / Pipeline":
-        for m in st.session_state.messages:
+        render_limit = int(st.session_state.get("chat_render_limit", DEFAULT_CHAT_RENDER_LIMIT))
+        all_messages = st.session_state.messages
+        shown_messages = all_messages[-render_limit:] if render_limit > 0 else all_messages
+        hidden_count = max(0, len(all_messages) - len(shown_messages))
+        if hidden_count > 0:
+            st.caption(
+                f"Showing last {len(shown_messages)} messages for smoother UI "
+                f"(hidden older messages: {hidden_count})."
+            )
+        for m in shown_messages:
             with st.chat_message(m["role"]):
                 st.markdown(m["content"])
 
@@ -1450,14 +1790,16 @@ def main():
     else:
         _render_alpha_mining_console(_w_max, str(st.session_state.get("sb_data", "data.pkl")))
 
+    # Only needed in Chat/Pipeline view — skip the scan entirely in Mining Console.
     last_code = None
-    for m in reversed(st.session_state.messages):
-        if m["role"] != "assistant":
-            continue
-        code = extract_python_code(m["content"])
-        if "def compute_factor_df" in code:
-            last_code = code
-            break
+    if ui_view == "Chat / Pipeline":
+        for m in reversed(st.session_state.messages):
+            if m["role"] != "assistant":
+                continue
+            code = extract_python_code(m["content"])
+            if "def compute_factor_df" in code:
+                last_code = code
+                break
 
     _provider_models = {
         "openai": ["gpt-4.1", "gpt-4o", "gpt-4o-mini"],
@@ -1481,194 +1823,29 @@ def main():
             key="sb_model",
         )
         st.slider("Temperature", 0.0, 1.0, 0.2, 0.05, key="sb_temp")
-        st.divider()
-        st.subheader("Pipeline (optional)")
-        data_pkl = st.text_input("Market pickle", value="data.pkl", key="sb_data")
-        artifact_dir = st.text_input(
-            "Artifact dir (under project root)",
-            value=st.session_state.artifact_default,
-            key="sb_art",
-        )
-        st.selectbox(
-            "Rank IC backend",
-            ["pandas", "torch"],
-            key="sb_pipeline_backend",
-            help="pandas: default CPU path; torch: supports CUDA/CPU device selection.",
-        )
-        st.text_input(
-            "Torch device",
-            value="auto",
-            key="sb_pipeline_device",
-            help="Used when backend=torch. Example: auto / cuda / cuda:0 / cpu",
-        )
-        st.slider(
-            "Parallel workers (Level-2: per-day IC/decile)",
-            min_value=1,
-            max_value=_w_max,
-            value=_w_default,
-            key="sb_pipeline_workers",
-            help="Per-trading-day IC/decile tasks run in a process pool when >1. Factor pickle step stays single-process.",
-        )
-        st.selectbox(
-            "Rank IC return horizon",
-            ["next-day forward", "same-day diagnostic"],
-            key="sb_pipeline_return_horizon",
-            help="Default is T signal vs T+1 return. Same-day is only for diagnostics.",
-        )
-        st.divider()
-        st.subheader("Export & run")
-        save_name = st.text_input("Save as (.py)", value=st.session_state.save_stub, key="sb_save")
-        save_path = gen_dir / save_name if save_name.endswith(".py") else gen_dir / f"{save_name}.py"
-        st.caption("Latest extractable `compute_factor_df` module is used for save/run.")
-        model = st.session_state.sb_model
-        if st.button("Save latest code → generated_factors", width="stretch", disabled=not last_code):
-            hdr = (
-                f"# Saved from Factor Agent UI — {datetime.now().isoformat(timespec='seconds')}\n"
-                f"# Model: {model}\n\n"
+        if ui_view == "Chat / Pipeline":
+            st.slider(
+                "Chat messages to render",
+                min_value=10,
+                max_value=200,
+                value=int(st.session_state.get("chat_render_limit", DEFAULT_CHAT_RENDER_LIMIT)),
+                step=10,
+                key="chat_render_limit",
+                help="Only render the latest N chat messages on each rerun to reduce UI lag.",
             )
-            save_path.write_text(hdr + last_code, encoding="utf-8")
-            st.success(f"Wrote {save_path.relative_to(ROOT)}")
-
-        if st.button("Run pipeline (pickle + Rank IC + backtest + plots)", width="stretch"):
-            if not last_code:
-                st.warning("No `compute_factor_df` in recent assistant replies.")
-            else:
-                hdr = (
-                    f"# Saved from Factor Agent UI — {datetime.now().isoformat(timespec='seconds')}\n"
-                    f"# Model: {model}\n\n"
-                )
-                save_path.write_text(hdr + last_code, encoding="utf-8")
-                pipe = AGENT_DIR / "factor_agent_pipeline.py"
-                cmd = [
-                    sys.executable,
-                    str(pipe),
-                    "--skip-generate",
-                    str(save_path),
-                    "--data",
-                    data_pkl,
-                    "--artifact-dir",
-                    artifact_dir,
-                ]
-                _workers = int(st.session_state.get("sb_pipeline_workers", _w_default))
-                if _workers > 1:
-                    cmd.extend(["--workers", str(_workers)])
-                _backend = str(st.session_state.get("sb_pipeline_backend", "pandas"))
-                _device = str(st.session_state.get("sb_pipeline_device", "auto")).strip() or "auto"
-                _ui_provider = str(st.session_state.get("sb_provider", "openai"))
-                cmd.extend(["--backend", _backend, "--device", _device, "--provider", _ui_provider])
-                if st.session_state.get("sb_pipeline_return_horizon") == "same-day diagnostic":
-                    cmd.append("--no-next-day")
-                if _jq is not None:
-                    job_id = _jq.submit(
-                        "pipeline",
-                        {"cmd": cmd, "cwd": str(ROOT), "artifact_dir": artifact_dir},
-                    )
-                    st.session_state["pipeline_job_id"] = job_id
-                    _invalidate_job_caches()
-                    st.success(f"Queued as job `{job_id}` — the worker will run it.")
-                else:
-                    st.error("job_queue not available — cannot submit job.")
-
-        _render_job_card(
-            st.session_state.get("pipeline_job_id"),
-            artifact_key="pipeline_artifact_dir",
-        )
-        st.divider()
-        st.subheader("Batch analysis (multi-level parallel)")
-        batch_factor_dir = st.text_input(
-            "Factor dir",
-            value="factors_by_type",
-            key="batch_factor_dir",
-        )
-        batch_out_dir = st.text_input(
-            "Batch output dir",
-            value="rankic_batch_results",
-            key="batch_out_dir",
-        )
-        st.selectbox(
-            "Batch backend",
-            ["pandas", "torch"],
-            key="batch_backend",
-            help="Applied to each factor's Rank IC computation.",
-        )
-        st.text_input(
-            "Batch torch device",
-            value="auto",
-            key="batch_device",
-        )
-        st.slider(
-            "Factor workers (Level-1: cross-factor parallel)",
-            min_value=1,
-            max_value=_w_max,
-            value=max(1, min(4, _w_default)),
-            key="batch_factor_workers",
-            help="Run multiple factor files in parallel.",
-        )
-        st.slider(
-            "IC workers (Level-2: per-factor/day parallel)",
-            min_value=1,
-            max_value=_w_max,
-            value=_w_default,
-            key="batch_ic_workers",
-            help="Workers used inside each factor for per-day IC/decile tasks.",
-        )
-        st.selectbox(
-            "Batch return horizon",
-            ["next-day forward", "same-day diagnostic"],
-            key="batch_return_horizon",
-            help="Default is T signal vs T+1 return. Same-day is only for diagnostics.",
-        )
-        if st.button("Run batch analysis", width="stretch"):
-            batch_script = ROOT / "scripts" / "analysis" / "batch_factor_analysis.py"
-            _factor_workers = int(st.session_state.get("batch_factor_workers", 1))
-            _ic_workers = int(st.session_state.get("batch_ic_workers", _w_default))
-            _batch_backend = str(st.session_state.get("batch_backend", "pandas"))
-            _batch_device = str(st.session_state.get("batch_device", "auto")).strip() or "auto"
-            cmd = [
-                sys.executable,
-                str(batch_script),
-                batch_factor_dir,
-                "--output-dir",
-                batch_out_dir,
-                "--data",
-                data_pkl,
-                "--factor-workers",
-                str(_factor_workers),
-                "--ic-workers",
-                str(_ic_workers),
-                "--backend",
-                _batch_backend,
-                "--device",
-                _batch_device,
-            ]
-            if st.session_state.get("batch_return_horizon") == "same-day diagnostic":
-                cmd.append("--no-next-day")
-            if _jq is not None:
-                job_id = _jq.submit(
-                    "batch_analysis",
-                    {"cmd": cmd, "cwd": str(ROOT), "artifact_dir": batch_out_dir},
-                )
-                st.session_state["batch_job_id"] = job_id
-                _invalidate_job_caches()
-                st.success(f"Queued as job `{job_id}` — the worker will run it.")
-            else:
-                st.error("job_queue not available — cannot submit job.")
-
-        _render_job_card(
-            st.session_state.get("batch_job_id"),
-            artifact_key="batch_artifact_dir",
-        )
-        _render_recent_jobs_sidebar()
-        st.divider()
-        if st.button("New conversation", width="stretch"):
-            st.session_state.messages = []
-            st.rerun()
+        if ui_view == "Chat / Pipeline":
+            _render_chat_pipeline_sidebar(gen_dir, last_code, _w_max, _w_default)
+        else:
+            _render_recent_jobs_sidebar()
 
     # Must run AFTER sidebar so session state set by sidebar buttons is visible.
     # Each block is gated to its own view — the other view's renders are completely
     # skipped, which eliminates the main source of slowness: checkpoint.json parsing,
     # glob scans, and CSV reads running on every chat interaction.
     if ui_view == "Chat / Pipeline":
+        st.divider()
+        _render_chat_jobs_panel()
+
         art_key = st.session_state.get("pipeline_artifact_dir")
         if art_key:
             art_show = Path(art_key)
