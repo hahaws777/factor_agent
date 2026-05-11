@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# start.sh — launch the job worker and Streamlit UI in a tmux session.
+# start.sh — launch the job worker and FastAPI UI in a tmux session.
 #
 # Usage:
 #   bash start.sh              # start (or attach to existing session)
@@ -14,18 +14,16 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 CONDA_QWEN="/mnt/c/Users/PC/Miniconda3/envs/qwen"
 PYTHON="$CONDA_QWEN/python.exe"
-STREAMLIT="$CONDA_QWEN/Scripts/streamlit.exe"
 SESSION="factor_agent"
-STREAMLIT_PORT=8501
+FASTAPI_PORT=8510
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 check_python() {
     [[ -f "$PYTHON" ]] || die "Python not found at $PYTHON — is the conda 'qwen' environment installed?"
-    [[ -f "$STREAMLIT" ]] || die "streamlit.exe not found at $STREAMLIT — run: conda run -n qwen pip install streamlit"
-    "$PYTHON" -c "import streamlit" 2>/dev/null \
-        || die "streamlit not importable — run: conda run -n qwen pip install -r requirements.txt"
+    "$PYTHON" -c "import fastapi, uvicorn" 2>/dev/null \
+        || die "fastapi/uvicorn not importable — run: conda run -n qwen pip install -r requirements.txt"
 }
 
 check_env() {
@@ -64,7 +62,7 @@ check_env
 # ── Create tmux session ───────────────────────────────────────────────────────
 #   Window layout:
 #     pane 0 (left)  — job worker
-#     pane 1 (right) — Streamlit UI
+#     pane 1 (right) — FastAPI UI
 
 tmux new-session  -d -s "$SESSION" -x 220 -y 50
 
@@ -72,10 +70,10 @@ tmux new-session  -d -s "$SESSION" -x 220 -y 50
 tmux send-keys -t "$SESSION:0" \
     "cd '$ROOT' && echo '=== Job Worker ===' && '$PYTHON' agent/job_worker.py" Enter
 
-# Pane 1: Streamlit (split right)
+# Pane 1: FastAPI (split right)
 tmux split-window -t "$SESSION:0" -h
 tmux send-keys -t "$SESSION:0.1" \
-    "cd '$ROOT' && echo '=== Streamlit UI ===' && '$STREAMLIT' run agent/ui/streamlit_app.py --server.port $STREAMLIT_PORT --server.fileWatcherType none --server.runOnSave false" Enter
+    "cd '$ROOT' && echo '=== FastAPI UI ===' && '$PYTHON' -m uvicorn agent.ui.fastapi_app:app --host 0.0.0.0 --port $FASTAPI_PORT --workers 1" Enter
 
 # Sensible pane titles
 tmux select-pane -t "$SESSION:0.0" -T "worker"
@@ -87,7 +85,7 @@ tmux select-pane -t "$SESSION:0.1"
 echo ""
 echo "Started session '$SESSION'."
 echo "  Worker  → left pane"
-echo "  UI      → http://localhost:$STREAMLIT_PORT"
+echo "  UI      → http://localhost:$FASTAPI_PORT"
 echo ""
 echo "Attaching now. To detach: Ctrl-B then D"
 echo "To stop everything: bash start.sh stop"

@@ -98,22 +98,19 @@ python agent/job_worker.py --poll-interval 5
 
 The worker claims one pending job at a time, pipes stdout/stderr to `agent_runs/job_logs/<job_id>.log`, stores the subprocess pid in the DB so the UI can cancel it, and marks the job `success` (exit 0) or `failed` (non-zero). A crash in one job never crashes the worker. Stop cleanly with `Ctrl-C` or `SIGTERM`.
 
-## Chat UI (local)
+## FastAPI UI (local)
 
 ```bash
-# Terminal 1 — start the worker first
-python agent/job_worker.py
-
-# Terminal 2 — start the UI
+# Start worker + FastAPI UI in one tmux session
 cd e:\data
-streamlit run agent/ui/streamlit_app.py
+bash start.sh
 ```
 
-Opens a browser (default `http://localhost:8501`): multi-turn chat, streaming replies, save generated code to `generated_factors/`.
+Opens a browser (default `http://localhost:8510`): multi-turn chat, factor generation, save generated code to `generated_factors/`.
 
-**Run pipeline / batch / mining** buttons submit jobs to the queue instantly — the UI never blocks. Each button shows an inline status card that updates on rerender (job id, status, elapsed time, cancel button, collapsible log tail). A **Recent jobs** expander in the sidebar lists the 8 most recent jobs across all types.
+**Run pipeline / batch / mining** actions submit jobs to the queue instantly — the UI never blocks. Use the **Jobs / Logs** tab to monitor job status, cancel running jobs, and inspect log tails.
 
-After a pipeline job succeeds, **scroll below the chat**: the main column shows **Rank IC metrics**, a **daily IC line chart**, and **decile PNGs** from `backtest_plots/`.
+After a pipeline or mining job succeeds, use **Alpha Mining Console** and **Jobs / Logs** tabs to inspect run summaries, candidate pages, generated files, and logs.
 
 ### Multi-level parallel in UI
 

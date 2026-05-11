@@ -1,8 +1,8 @@
 # Factor Research Workspace
 
-Evolutionary alpha mining system for China A-shares: LLM-generated factors, Rank IC evaluation, factor screening, and a Streamlit chat UI.
+Evolutionary alpha mining system for China A-shares: LLM-generated factors, Rank IC evaluation, factor screening, and a FastAPI-based chat/mining console.
 
-- `agent/` — LLM factor generation, evolutionary miner, pipeline runner, Streamlit UI
+- `agent/` — LLM factor generation, evolutionary miner, pipeline runner, FastAPI UI
 - `scripts/` — analysis, batch tools, plotting, data utilities, download helpers
 
 ---
@@ -17,7 +17,7 @@ source venv312/bin/activate        # Windows: venv312\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Requires **Python 3.10+**. The `requirements.txt` covers all dependencies including `akshare`, `openai`, `anthropic`, `pandas`, `scipy`, `streamlit`, and `pyyaml`.
+Requires **Python 3.10+**. The `requirements.txt` covers all dependencies including `akshare`, `openai`, `anthropic`, `pandas`, `scipy`, `fastapi`, `uvicorn`, and `pyyaml`.
 
 ### 2) API Keys
 
@@ -86,20 +86,21 @@ python agent/job_worker.py --poll-interval 5
 
 The worker claims one pending job at a time, streams stdout/stderr to `agent_runs/job_logs/<job_id>.log`, and updates job status (pending → running → success/failed) in `agent_runs/jobs.db`. Stop with `Ctrl-C` or `SIGTERM`; the current job finishes cleanly before the worker exits.
 
-### 7) Run Chat UI
+### 7) Run FastAPI UI
 
 ```bash
-streamlit run agent/ui/streamlit_app.py
+bash start.sh
 ```
 
 The UI supports:
-- **Provider selection** — switch between OpenAI and Anthropic models in the sidebar
-- **Async job submission** — pipeline runs, batch analysis, and mining start/resume are submitted to the job queue instantly; the UI never blocks waiting for results
-- **Inline job status** — each submit button shows a live status card (pending / running / success / failed) with a collapsible log tail and a cancel button
-- **Recent jobs panel** — compact sidebar expander listing the 8 most recent jobs across all types
-- **Multi-level parallel controls** — Level-2 per-day IC workers for single runs; Level-1 factor workers + Level-2 IC workers for batch
-- **Backend/device selection** — `pandas` or `torch` with `cuda/cpu/auto`
-- **Alpha Miner viewer** — browse mining run checkpoint, top factors, and full report directly from the UI
+- **Chat / Pipeline tab** — conversational factor generation with provider/model controls
+- **Code export + pipeline submit** — save generated factor modules and submit pipeline jobs
+- **Batch analysis submit** — Level-1 factor workers + Level-2 IC workers
+- **Alpha Mining Console tab** — start/resume runs, browse runs, paginate candidate tables
+- **Jobs / Logs tab** — list/cancel jobs, inspect log tails
+- **Backend/device controls** — `pandas` / `torch` and `cuda/cpu/auto`
+
+Open [http://localhost:8510](http://localhost:8510) after startup.
 
 ---
 
@@ -383,7 +384,7 @@ E:/data/
 │   ├── factor_orchestrator.py    single-factor + batch CLI
 │   ├── job_queue.py              SQLite-backed async job queue (submit/claim/status)
 │   ├── job_worker.py             background worker — polls queue, runs jobs as subprocesses
-│   └── ui/streamlit_app.py       chat UI + pipeline + batch + miner viewer
+│   └── ui/fastapi_app.py         FastAPI backend for chat/pipeline/batch/mining UI
 ├── scripts/
 │   ├── analysis/
 │   │   ├── factor_rankic_analysis.py   Rank IC engine (limit-up NaN-safe)
@@ -436,7 +437,7 @@ E:/data/
 
 ## Repository Structure
 
-- `agent/` — factor code generation, evolutionary miner, pipeline, Streamlit UI
+- `agent/` — factor code generation, evolutionary miner, pipeline, FastAPI UI
 - `scripts/analysis/` — Rank IC, batch analysis, IC decay
 - `scripts/plotting/` — result plotting helpers
 - `scripts/download/` — factor and index download scripts

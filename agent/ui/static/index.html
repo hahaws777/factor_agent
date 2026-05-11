@@ -1,0 +1,613 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Factor Agent Console</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0f1117;
+        --panel: #171a23;
+        --line: #2a2f3a;
+        --text: #e9edf3;
+        --muted: #9ca6b5;
+      }
+      * { box-sizing: border-box; }
+      body { margin: 0; background: var(--bg); color: var(--text); font-family: Inter, Segoe UI, Arial, sans-serif; }
+      .wrap { width: min(1360px, 96vw); margin: 16px auto 28px; }
+      h1 { margin: 0; font-size: 1.3rem; }
+      h2 { margin: 0 0 8px; font-size: 1rem; }
+      .muted { color: var(--muted); font-size: 0.88rem; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.84rem; }
+      .tabs { display: flex; gap: 8px; margin: 12px 0; }
+      .tab-btn {
+        border: 1px solid #3d4a60; background: #1f2531; color: var(--text);
+        border-radius: 8px; padding: 8px 12px; cursor: pointer;
+      }
+      .tab-btn.active { border-color: #6ba0ff; background: #1f2a43; }
+      .tab { display: none; }
+      .tab.active { display: block; }
+      .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+      .row3 { display: grid; grid-template-columns: 1.4fr 1fr 1fr; gap: 12px; }
+      .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+      .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+      button { border: 1px solid #3d4a60; background: #1f2531; color: var(--text); border-radius: 8px; padding: 6px 10px; cursor: pointer; }
+      button:hover { border-color: #6ba0ff; }
+      button:disabled { opacity: 0.6; cursor: not-allowed; }
+      input, select, textarea {
+        border: 1px solid #3d4a60; background: #10141d; color: var(--text);
+        border-radius: 6px; padding: 6px 8px;
+      }
+      textarea { width: 100%; min-height: 66px; resize: vertical; }
+      table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+      th, td { border-bottom: 1px solid #2d3442; text-align: left; padding: 6px 4px; vertical-align: top; }
+      th { color: var(--muted); font-weight: 600; }
+      .scroll { overflow: auto; max-height: 380px; }
+      .chat-box { max-height: 480px; overflow: auto; border: 1px solid #283042; border-radius: 8px; padding: 8px; background: #0f131c; }
+      .chat-msg { padding: 8px; margin-bottom: 8px; border-radius: 8px; border: 1px solid #2e3545; }
+      .chat-msg.user { background: #1a2335; }
+      .chat-msg.assistant { background: #1a1d27; }
+      .status-pill { display: inline-block; border-radius: 999px; padding: 2px 8px; font-size: 0.78rem; border: 1px solid #3a4356; }
+      .running { color: #ffd27d; border-color: #7a5b1e; }
+      .success { color: #8ce0b0; border-color: #2a6e44; }
+      .failed, .cancelled { color: #ff9e9e; border-color: #7f3131; }
+      .pending { color: #a9c4ff; border-color: #39578d; }
+      #logBox { max-height: 360px; overflow: auto; white-space: pre-wrap; border: 1px solid #283042; border-radius: 8px; padding: 10px; background: #0d1118; }
+      @media (max-width: 1050px) { .row, .row3 { grid-template-columns: 1fr; } }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>Factor Agent Console (FastAPI)</h1>
+      <div class="muted" id="healthText">Loading health...</div>
+
+      <div class="tabs">
+        <button class="tab-btn active" data-tab="tab-chat">Chat / Pipeline</button>
+        <button class="tab-btn" data-tab="tab-mining">Alpha Mining Console</button>
+        <button class="tab-btn" data-tab="tab-jobs">Jobs / Logs</button>
+      </div>
+
+      <section id="tab-chat" class="tab active">
+        <div class="row3">
+          <div class="panel">
+            <h2>Chat</h2>
+            <div class="chat-box" id="chatBox"></div>
+            <div class="toolbar" style="margin-top: 8px;">
+              <select id="chatProvider"></select>
+              <select id="chatModel"></select>
+              <label>Temp <input id="chatTemp" type="number" min="0" max="1" step="0.05" value="0.2" style="width:70px;" /></label>
+              <button id="chatSendBtn">Send</button>
+              <button id="chatClearBtn">New conversation</button>
+            </div>
+            <textarea id="chatInput" placeholder="Describe a factor, or ask for a revision..."></textarea>
+            <div class="toolbar" style="margin-top: 8px;">
+              <label>Save as <input id="saveName" value="" placeholder="chat_yyyymmdd_hhmmss.py" /></label>
+              <button id="saveCodeBtn">Save latest code</button>
+            </div>
+            <div class="muted" id="chatMeta"></div>
+          </div>
+
+          <div class="panel">
+            <h2>Pipeline submit</h2>
+            <div class="toolbar">
+              <label>Market pickle <input id="pipeData" value="data.pkl" /></label>
+              <label>Artifact dir <input id="pipeArtifact" value="agent_runs/chat_ui" /></label>
+            </div>
+            <div class="toolbar">
+              <label>Workers <input id="pipeWorkers" type="number" min="1" max="32" value="1" style="width:70px;" /></label>
+              <label>Backend <select id="pipeBackend"><option>pandas</option><option>torch</option></select></label>
+              <label>Device <input id="pipeDevice" value="auto" style="width:88px;" /></label>
+              <label>Horizon <select id="pipeHorizon"><option>next-day forward</option><option>same-day diagnostic</option></select></label>
+            </div>
+            <button id="runPipelineBtn">Run pipeline from latest code</button>
+            <div class="muted" id="pipeMeta" style="margin-top:8px;"></div>
+          </div>
+
+          <div class="panel">
+            <h2>Batch analysis submit</h2>
+            <div class="toolbar">
+              <label>Factor dir <input id="batchFactorDir" value="factors_by_type" /></label>
+              <label>Output dir <input id="batchOutDir" value="rankic_batch_results" /></label>
+            </div>
+            <div class="toolbar">
+              <label>Market pickle <input id="batchData" value="data.pkl" /></label>
+            </div>
+            <div class="toolbar">
+              <label>Factor workers <input id="batchFactorWorkers" type="number" min="1" max="32" value="1" style="width:70px;" /></label>
+              <label>IC workers <input id="batchIcWorkers" type="number" min="1" max="32" value="4" style="width:70px;" /></label>
+            </div>
+            <div class="toolbar">
+              <label>Backend <select id="batchBackend"><option>pandas</option><option>torch</option></select></label>
+              <label>Device <input id="batchDevice" value="auto" style="width:88px;" /></label>
+              <label>Horizon <select id="batchHorizon"><option>next-day forward</option><option>same-day diagnostic</option></select></label>
+            </div>
+            <button id="runBatchBtn">Run batch analysis</button>
+            <div class="muted" id="batchMeta" style="margin-top:8px;"></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="tab-mining" class="tab">
+        <div class="row">
+          <div class="panel">
+            <h2>Run controls</h2>
+            <div class="toolbar">
+              <label>Run ID <input id="miningRunId" /></label>
+              <label>Config <input id="miningConfig" value="agent/alpha_mining_config.yaml" /></label>
+            </div>
+            <div class="toolbar">
+              <label>Data <input id="miningData" value="data.pkl" /></label>
+              <label>Generations <input id="miningGen" type="number" min="1" max="50" value="1" style="width:70px;" /></label>
+              <label>Per gen <input id="miningPerGen" type="number" min="1" max="100" value="3" style="width:70px;" /></label>
+              <label>Outer workers <input id="miningOuter" type="number" min="1" max="32" value="1" style="width:70px;" /></label>
+            </div>
+            <div class="toolbar">
+              <label>Provider <select id="miningProvider"></select></label>
+              <label>Model <select id="miningModel"></select></label>
+              <button id="startMiningBtn">Start mining</button>
+              <button id="resumeMiningBtn">Resume selected run</button>
+            </div>
+            <div class="muted" id="miningMeta"></div>
+          </div>
+          <div class="panel">
+            <h2>Existing runs</h2>
+            <div class="toolbar">
+              <button id="refreshRunsBtn">Refresh runs</button>
+              <label>Limit <input id="runsLimit" type="number" min="1" max="200" value="30" style="width:80px;" /></label>
+            </div>
+            <div class="scroll">
+              <table id="runsTable">
+                <thead><tr><th>Run ID</th><th>Gen</th><th>Best grade</th><th>Best Rank IC</th><th>Candidates</th><th>Action</th></tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+            <div class="muted" id="runsMeta"></div>
+          </div>
+        </div>
+        <div class="row" style="margin-top:12px;">
+          <div class="panel">
+            <h2>Run candidates (paged)</h2>
+            <div class="toolbar">
+              <label>Run ID <input id="candRunId" placeholder="mining_ui_xxx" /></label>
+              <label>Family <select id="candFamily"><option>all</option></select></label>
+              <label>Include rejected <input id="candIncludeRejected" type="checkbox" checked /></label>
+            </div>
+            <div class="toolbar">
+              <label>Page size <input id="candLimit" type="number" min="10" max="500" value="50" style="width:90px;" /></label>
+              <label>Offset <input id="candOffset" type="number" min="0" value="0" style="width:90px;" /></label>
+              <button id="loadCandBtn">Load candidates</button>
+            </div>
+            <div class="muted" id="candMeta"></div>
+            <div class="scroll">
+              <table id="candTable">
+                <thead><tr><th>Name</th><th>Gen</th><th>Family</th><th>Grade</th><th>Mean Rank IC</th><th>IR</th><th>Error</th></tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="panel">
+            <h2>Run files</h2>
+            <div class="toolbar">
+              <button id="loadRunFilesBtn">Load run files</button>
+            </div>
+            <div id="runFilesBox" class="mono" style="max-height:420px; overflow:auto; white-space:pre-wrap;"></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="tab-jobs" class="tab">
+        <div class="row">
+          <div class="panel">
+            <h2>Jobs</h2>
+            <div class="toolbar">
+              <button id="refreshJobsBtn">Refresh jobs</button>
+              <label>Limit <input id="jobsLimit" type="number" min="1" max="300" value="60" style="width:80px;" /></label>
+              <label><input type="checkbox" id="autoJobs" checked /> Auto refresh (3s)</label>
+            </div>
+            <div class="scroll">
+              <table id="jobsTable">
+                <thead><tr><th>#</th><th>Type</th><th>Status</th><th>Run</th><th>Submitted</th><th>Action</th></tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+            <div class="muted" id="jobsMeta"></div>
+          </div>
+          <div class="panel">
+            <h2>Log tail</h2>
+            <div class="toolbar">
+              <label>Path <input id="logPath" placeholder="agent_runs/job_logs/123.log" size="34" /></label>
+              <label>Lines <input id="logLines" type="number" min="10" max="500" value="120" style="width:90px;" /></label>
+              <button id="loadLogBtn">Load log</button>
+            </div>
+            <div id="logBox" class="mono"></div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <script>
+      const state = {
+        health: null,
+        messages: [],
+        latestCode: "",
+      };
+
+      const byId = (id) => document.getElementById(id);
+      const esc = (s) => String(s ?? "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
+
+      function nowStub() {
+        const d = new Date();
+        const p = (n) => String(n).padStart(2, "0");
+        return `chat_${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}.py`;
+      }
+
+      async function api(url, options = {}) {
+        const resp = await fetch(url, { headers: { "Content-Type": "application/json" }, ...options });
+        if (!resp.ok) {
+          const txt = await resp.text();
+          throw new Error(`${resp.status}: ${txt}`);
+        }
+        return resp.json();
+      }
+
+      function switchTab(tabId) {
+        document.querySelectorAll(".tab-btn").forEach((x) => x.classList.toggle("active", x.dataset.tab === tabId));
+        document.querySelectorAll(".tab").forEach((x) => x.classList.toggle("active", x.id === tabId));
+      }
+
+      function statusPill(status) {
+        const s = String(status || "unknown");
+        return `<span class="status-pill ${esc(s)}">${esc(s)}</span>`;
+      }
+
+      function renderChat() {
+        const box = byId("chatBox");
+        box.innerHTML = state.messages.slice(-30).map((m) => `
+          <div class="chat-msg ${esc(m.role)}">
+            <div class="muted">${esc(m.role)}</div>
+            <div>${esc(m.content).replaceAll("\n","<br/>")}</div>
+          </div>
+        `).join("");
+        box.scrollTop = box.scrollHeight;
+      }
+
+      function providerModels(provider) {
+        return (state.health?.providers?.[provider] || []);
+      }
+
+      function syncModelOptions(providerSelId, modelSelId) {
+        const provider = byId(providerSelId).value;
+        const modelSel = byId(modelSelId);
+        const models = providerModels(provider);
+        modelSel.innerHTML = models.map((m) => `<option>${esc(m)}</option>`).join("");
+        if (models.length) modelSel.value = models[0];
+      }
+
+      async function loadHealth() {
+        try {
+          state.health = await api("/api/health");
+          byId("healthText").textContent = `API ready · job_queue=${state.health.job_queue_available ? "on" : "off"} · openai_key=${state.health.has_openai_key} · anthropic_key=${state.health.has_anthropic_key}`;
+          const providers = Object.keys(state.health.providers || {});
+          byId("chatProvider").innerHTML = providers.map((p) => `<option>${esc(p)}</option>`).join("");
+          byId("miningProvider").innerHTML = providers.map((p) => `<option>${esc(p)}</option>`).join("");
+          syncModelOptions("chatProvider", "chatModel");
+          syncModelOptions("miningProvider", "miningModel");
+        } catch (err) {
+          byId("healthText").textContent = `Health check failed: ${err.message}`;
+        }
+      }
+
+      async function sendChat() {
+        const prompt = byId("chatInput").value.trim();
+        if (!prompt) return;
+        state.messages.push({ role: "user", content: prompt });
+        renderChat();
+        byId("chatInput").value = "";
+        byId("chatSendBtn").disabled = true;
+        byId("chatMeta").textContent = "Generating...";
+        try {
+          const data = await api("/api/chat/completion", {
+            method: "POST",
+            body: JSON.stringify({
+              messages: state.messages,
+              provider: byId("chatProvider").value,
+              model: byId("chatModel").value,
+              temperature: Number(byId("chatTemp").value || 0.2),
+            }),
+          });
+          state.messages.push({ role: "assistant", content: data.assistant || "" });
+          state.latestCode = data.extracted_code || "";
+          renderChat();
+          byId("chatMeta").textContent = data.has_compute_factor ? "Latest reply contains compute_factor_df." : "No compute_factor_df found in latest reply.";
+          if (!byId("saveName").value) byId("saveName").value = nowStub();
+        } catch (err) {
+          byId("chatMeta").textContent = `Chat failed: ${err.message}`;
+        } finally {
+          byId("chatSendBtn").disabled = false;
+        }
+      }
+
+      async function saveLatestCode() {
+        if (!state.latestCode.trim()) {
+          byId("chatMeta").textContent = "No extracted code to save.";
+          return;
+        }
+        try {
+          const data = await api("/api/code/save", {
+            method: "POST",
+            body: JSON.stringify({
+              code: state.latestCode,
+              filename: byId("saveName").value || nowStub(),
+              model: byId("chatModel").value,
+            }),
+          });
+          byId("chatMeta").textContent = `Saved: ${data.relative_path}`;
+        } catch (err) {
+          byId("chatMeta").textContent = `Save failed: ${err.message}`;
+        }
+      }
+
+      async function runPipeline() {
+        byId("pipeMeta").textContent = "Submitting pipeline job...";
+        try {
+          const data = await api("/api/jobs/pipeline", {
+            method: "POST",
+            body: JSON.stringify({
+              code: state.latestCode,
+              save_name: byId("saveName").value || nowStub(),
+              data_pkl: byId("pipeData").value,
+              artifact_dir: byId("pipeArtifact").value,
+              workers: Number(byId("pipeWorkers").value || 1),
+              backend: byId("pipeBackend").value,
+              device: byId("pipeDevice").value,
+              provider: byId("chatProvider").value,
+              return_horizon: byId("pipeHorizon").value,
+            }),
+          });
+          byId("pipeMeta").textContent = `Queued pipeline job ${data.job_id}`;
+          loadJobs();
+        } catch (err) {
+          byId("pipeMeta").textContent = `Pipeline submit failed: ${err.message}`;
+        }
+      }
+
+      async function runBatch() {
+        byId("batchMeta").textContent = "Submitting batch job...";
+        try {
+          const data = await api("/api/jobs/batch", {
+            method: "POST",
+            body: JSON.stringify({
+              factor_dir: byId("batchFactorDir").value,
+              output_dir: byId("batchOutDir").value,
+              data_pkl: byId("batchData").value,
+              factor_workers: Number(byId("batchFactorWorkers").value || 1),
+              ic_workers: Number(byId("batchIcWorkers").value || 1),
+              backend: byId("batchBackend").value,
+              device: byId("batchDevice").value,
+              return_horizon: byId("batchHorizon").value,
+            }),
+          });
+          byId("batchMeta").textContent = `Queued batch job ${data.job_id}`;
+          loadJobs();
+        } catch (err) {
+          byId("batchMeta").textContent = `Batch submit failed: ${err.message}`;
+        }
+      }
+
+      async function startMining() {
+        byId("miningMeta").textContent = "Submitting mining start...";
+        try {
+          const data = await api("/api/jobs/mining/start", {
+            method: "POST",
+            body: JSON.stringify({
+              run_id: byId("miningRunId").value.trim(),
+              config_path: byId("miningConfig").value,
+              data_pkl: byId("miningData").value,
+              generations: Number(byId("miningGen").value || 1),
+              per_gen: Number(byId("miningPerGen").value || 3),
+              outer_workers: Number(byId("miningOuter").value || 1),
+              provider: byId("miningProvider").value,
+              model: byId("miningModel").value,
+            }),
+          });
+          byId("miningMeta").textContent = `Queued mining start job ${data.job_id}`;
+          loadRuns();
+          loadJobs();
+        } catch (err) {
+          byId("miningMeta").textContent = `Mining start failed: ${err.message}`;
+        }
+      }
+
+      async function resumeMining() {
+        const runId = byId("candRunId").value.trim() || byId("miningRunId").value.trim();
+        if (!runId) { byId("miningMeta").textContent = "Set run id first."; return; }
+        byId("miningMeta").textContent = "Submitting mining resume...";
+        try {
+          const data = await api("/api/jobs/mining/resume", {
+            method: "POST",
+            body: JSON.stringify({ run_id: runId, config_path: byId("miningConfig").value }),
+          });
+          byId("miningMeta").textContent = `Queued mining resume job ${data.job_id}`;
+          loadJobs();
+        } catch (err) {
+          byId("miningMeta").textContent = `Mining resume failed: ${err.message}`;
+        }
+      }
+
+      async function loadRuns() {
+        const limit = Number(byId("runsLimit").value || 30);
+        const tbody = document.querySelector("#runsTable tbody");
+        try {
+          const data = await api(`/api/runs?limit=${limit}`);
+          byId("runsMeta").textContent = `Loaded ${data.count} runs`;
+          tbody.innerHTML = data.items.map((r) => `
+            <tr>
+              <td class="mono">${esc(r.run_id)}</td>
+              <td>${esc(r.generations_done)}</td>
+              <td>${esc(r.best_grade)}</td>
+              <td>${Number(r.best_mean_rank_ic || 0).toFixed(4)}</td>
+              <td>${esc(r.candidate_count)}</td>
+              <td>
+                <button data-run-cands="${esc(r.run_id)}">Candidates</button>
+                ${r.log_path ? `<button data-run-log="${esc(r.log_path)}">Log</button>` : ""}
+              </td>
+            </tr>
+          `).join("");
+        } catch (err) {
+          byId("runsMeta").textContent = `Failed: ${err.message}`;
+          tbody.innerHTML = "";
+        }
+      }
+
+      async function loadCandidates() {
+        const runId = byId("candRunId").value.trim();
+        if (!runId) { byId("candMeta").textContent = "Please input run id."; return; }
+        const limit = Number(byId("candLimit").value || 50);
+        const offset = Number(byId("candOffset").value || 0);
+        const includeRejected = byId("candIncludeRejected").checked;
+        const family = byId("candFamily").value || "all";
+        const tbody = document.querySelector("#candTable tbody");
+        try {
+          const url = `/api/runs/${encodeURIComponent(runId)}/candidates?limit=${limit}&offset=${offset}&include_rejected=${includeRejected}&family=${encodeURIComponent(family)}`;
+          const data = await api(url);
+          byId("candMeta").textContent = `Showing ${data.count}/${data.total}, offset=${data.offset}, limit=${data.limit}`;
+          byId("candFamily").innerHTML = ["all", ...(data.families || [])].map((f) => `<option>${esc(f)}</option>`).join("");
+          if ((data.families || []).includes(family)) byId("candFamily").value = family;
+          tbody.innerHTML = data.items.map((x) => `
+            <tr>
+              <td class="mono">${esc(x.name)}</td>
+              <td>${esc(x.generation)}</td>
+              <td>${esc(x.family)}</td>
+              <td>${esc(x.grade)}</td>
+              <td>${x.mean_rank_ic == null ? "" : Number(x.mean_rank_ic).toFixed(4)}</td>
+              <td>${x.rank_ic_ir == null ? "" : Number(x.rank_ic_ir).toFixed(4)}</td>
+              <td>${esc(x.error || "")}</td>
+            </tr>
+          `).join("");
+          await api("/api/ui-state/mining", { method: "POST", body: JSON.stringify({ run_id: runId }) });
+        } catch (err) {
+          byId("candMeta").textContent = `Failed: ${err.message}`;
+          tbody.innerHTML = "";
+        }
+      }
+
+      async function loadRunFiles() {
+        const runId = byId("candRunId").value.trim();
+        if (!runId) { byId("runFilesBox").textContent = "Please input run id."; return; }
+        try {
+          const data = await api(`/api/runs/${encodeURIComponent(runId)}/files`);
+          byId("runFilesBox").textContent = JSON.stringify(data, null, 2);
+        } catch (err) {
+          byId("runFilesBox").textContent = `Failed: ${err.message}`;
+        }
+      }
+
+      async function loadJobs() {
+        const limit = Number(byId("jobsLimit").value || 60);
+        const tbody = document.querySelector("#jobsTable tbody");
+        try {
+          const data = await api(`/api/jobs?limit=${limit}`);
+          byId("jobsMeta").textContent = `Loaded ${data.count} jobs`;
+          tbody.innerHTML = data.items.map((j) => `
+            <tr>
+              <td class="mono">${esc(j.id)}</td>
+              <td>${esc(j.job_type)}</td>
+              <td>${statusPill(j.status)}</td>
+              <td class="mono">${esc(j.run_id || "")}</td>
+              <td class="mono">${esc(j.created_at || "")}</td>
+              <td>
+                <button data-job-cancel="${esc(j.id)}">Cancel</button>
+                <button data-job-log="${esc(j.log_path || "")}">Log</button>
+              </td>
+            </tr>
+          `).join("");
+        } catch (err) {
+          byId("jobsMeta").textContent = `Failed: ${err.message}`;
+          tbody.innerHTML = "";
+        }
+      }
+
+      async function loadLog(pathOverride = "") {
+        const raw = pathOverride || byId("logPath").value.trim();
+        if (!raw) { byId("logBox").textContent = "Please input log path."; return; }
+        const lines = Number(byId("logLines").value || 120);
+        try {
+          byId("logPath").value = raw;
+          const data = await api(`/api/logs/tail?path=${encodeURIComponent(raw)}&lines=${lines}`);
+          byId("logBox").textContent = data.tail || "(empty)";
+        } catch (err) {
+          byId("logBox").textContent = `Failed: ${err.message}`;
+        }
+      }
+
+      document.querySelectorAll(".tab-btn").forEach((btn) => btn.addEventListener("click", () => switchTab(btn.dataset.tab)));
+      byId("chatProvider").addEventListener("change", () => syncModelOptions("chatProvider", "chatModel"));
+      byId("miningProvider").addEventListener("change", () => syncModelOptions("miningProvider", "miningModel"));
+      byId("chatSendBtn").addEventListener("click", sendChat);
+      byId("chatClearBtn").addEventListener("click", () => { state.messages = []; state.latestCode = ""; renderChat(); byId("chatMeta").textContent = "Conversation cleared."; });
+      byId("saveCodeBtn").addEventListener("click", saveLatestCode);
+      byId("runPipelineBtn").addEventListener("click", runPipeline);
+      byId("runBatchBtn").addEventListener("click", runBatch);
+      byId("startMiningBtn").addEventListener("click", startMining);
+      byId("resumeMiningBtn").addEventListener("click", resumeMining);
+      byId("refreshRunsBtn").addEventListener("click", loadRuns);
+      byId("loadCandBtn").addEventListener("click", loadCandidates);
+      byId("loadRunFilesBtn").addEventListener("click", loadRunFiles);
+      byId("refreshJobsBtn").addEventListener("click", loadJobs);
+      byId("loadLogBtn").addEventListener("click", () => loadLog());
+
+      document.querySelector("#runsTable tbody").addEventListener("click", async (e) => {
+        const runId = e.target?.dataset?.runCands;
+        const runLog = e.target?.dataset?.runLog;
+        if (runId) {
+          byId("candRunId").value = runId;
+          byId("miningRunId").value = runId;
+          byId("candOffset").value = "0";
+          await loadCandidates();
+        }
+        if (runLog) {
+          await loadLog(runLog);
+          switchTab("tab-jobs");
+        }
+      });
+
+      document.querySelector("#jobsTable tbody").addEventListener("click", async (e) => {
+        const cancelId = e.target?.dataset?.jobCancel;
+        const logPath = e.target?.dataset?.jobLog;
+        if (cancelId) {
+          try {
+            await api(`/api/jobs/${cancelId}/cancel`, { method: "POST" });
+            await loadJobs();
+          } catch (err) {
+            byId("jobsMeta").textContent = `Cancel failed: ${err.message}`;
+          }
+        }
+        if (logPath) {
+          await loadLog(logPath);
+        }
+      });
+
+      setInterval(() => {
+        if (byId("autoJobs").checked) loadJobs().catch(() => {});
+      }, 3000);
+
+      (async () => {
+        byId("saveName").value = nowStub();
+        byId("miningRunId").value = `mining_ui_${new Date().toISOString().replaceAll("-","").replaceAll(":","").slice(0,15).replace("T","_")}`;
+        await loadHealth();
+        await loadRuns();
+        await loadJobs();
+        const uiState = await api("/api/ui-state/mining").catch(() => ({}));
+        const savedDir = String(uiState.current_run_dir || "");
+        if (savedDir) {
+          const runId = savedDir.split(/[\\/]/).pop();
+          if (runId) {
+            byId("candRunId").value = runId;
+            byId("miningRunId").value = runId;
+          }
+        }
+      })();
+    </script>
+  </body>
+</html>
